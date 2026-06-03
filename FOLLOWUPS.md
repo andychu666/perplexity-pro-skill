@@ -1,10 +1,64 @@
 # Follow-ups
 
-Tracked items from the GitNexus-assisted reviews of the `--discover` mode (PR #1)
-and the `--help`/unknown-flag fix (PR #2). Severe/correctness issues were fixed in
-the PRs; the items below are deferred.
+Tracked items from the GitNexus-assisted reviews of the `--discover` mode (PR #1),
+the `--help`/unknown-flag fix (PR #2), and the truncated-answer fix (PR #3).
+Severe/correctness issues were fixed in the PRs; the items below are deferred.
 
 ---
+
+## PR #3 — truncated-answer extraction in `waitForAnswer`
+
+GitNexus-style review: `waitForAnswer` is **MEDIUM** risk. d=1 callers are
+`runQuery`'s `--chat` branch and the standard/deep/computer branch; both destructure
+`{ text, isImageGen }` and the return shape is unchanged, so no caller breakage. All
+query execution flows (standard/brief/detailed/chat/deep/computer) run the changed
+code; image-generation returns early and is unaffected.
+
+### Fixed in PR #3
+
+- **[SEVERE] Long / list-heavy answers were truncated to the first fragment.** The
+  old streaming poll exited the first time two consecutive 1.5s polls matched, and
+  extraction grabbed the *last* `[class*="prose"]` block. Long answers pause
+  mid-stream while sources load, so polling stopped on item 1, and the last prose
+  block is often a short trailing/related block. Result: "top 10 news" returned
+  ~80 chars. Fixed by selecting the **longest** prose block and requiring multiple
+  consecutive identical polls before accepting the text.
+- **[SEVERE regression introduced then fixed in-PR] Completion gated on a fragile
+  "still generating" heuristic pinned polling to the full timeout.** The first
+  iteration required `!isGenerating()` before accepting a stable answer, and
+  `isGenerating()` matched persistent skeleton loaders (`animate-pulse`) and any
+  `stop`-labelled control — so it could return `true` forever, forcing the loop to
+  run until `timeoutMs` (120s standard, 10min deep, 30min computer) even when the
+  answer was ready in ~10s. Fixed by making the not-generating signal an
+  *accelerant* only: accept on text stability alone (`STABLE_NO_HINT = 5` polls),
+  and confirm faster when the UI reports not-generating (`STABLE_WITH_HINT = 2`).
+  Dropped the `animate-pulse`/`loading`/`spinner` selectors from the hint to avoid
+  false positives. Verified: short query returns in ~17s (not 120s); "top 10 news"
+  returns the full ~2000-char list in ~18s.
+
+### Deferred from PR #3
+
+- **[MEDIUM] No automated test covers `waitForAnswer`.** It is pure DOM-timing
+  logic that requires a live Perplexity page, so it is untested by the existing
+  `node:test` suite. The two severe bugs both lived here.
+  - **Action:** extract the stability state machine (poll → compare → stableCount
+    → exit decision) into a pure, injectable function (text source + clock as
+    params) so it can be unit-tested without Chrome. Add cases for: growing-then-
+    stable text, never-stabilizes (timeout), and the not-generating accelerant.
+- **[LOW] `extractText` longest-block heuristic could pick a non-answer block.** If
+  Perplexity ever renders a related/sources block longer than the answer body, the
+  "longest prose block" rule would select the wrong element.
+  - **Action:** prefer a block scoped to the answer container (e.g. nearest ancestor
+    matching an answer/thread test-id) before falling back to longest-overall.
+- **[LOW] `isGenerating` `stop` label is locale-dependent.** The check matches the
+  English substring `"stop"`; in other Perplexity locales the accelerant simply
+  won't fire (falls back to `STABLE_NO_HINT`), so it's safe but slower.
+  - **Action:** none required; revisit if non-English usage becomes common.
+- **[INFO] Trailing citation noise in answers.** Extracted text still contains
+  inline source markers like `bbc\n+1`. Pre-existing behaviour, not introduced by
+  this PR.
+  - **Action:** optionally strip standalone `\n<source>\n+N` lines in a post-process
+    step, keyed off the already-extracted `sources` array.
 
 ## PR #2 — `--help` / unknown-flag handling
 

@@ -1,0 +1,9 @@
+{
+	"name": "perplexity-pro",
+	"version": "1.0.0",
+	"description": "Query Perplexity Pro for grounded answers with citations via Chrome CDP (puppeteer-core)",
+	"license": "MIT",
+	"dependencies": {
+		"puppeteer-core": "^23.11.1"
+	}
+}

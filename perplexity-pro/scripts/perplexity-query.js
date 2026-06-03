@@ -1,0 +1,505 @@
+#!/usr/bin/env node
+/**
+ * perplexity-query.js - Query Perplexity Pro via Chrome CDP (pi-adapted)
+ *
+ * Uses puppeteer-core instead of playwright-core, connects to pi's Chrome on :9222.
+ *
+ * Usage: node perplexity-query.js [flags] "your question here"
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+// Resolve puppeteer-core from this skill's own node_modules first, then fall
+// back to common locations (e.g. the pi browser-tools skill) so users don't
+// have to reinstall if they already have it.
+function loadPuppeteer() {
+  const candidates = [
+    'puppeteer-core',
+    path.join(__dirname, '..', 'node_modules', 'puppeteer-core'),
+    process.env.PUPPETEER_CORE_PATH,
+    path.join(process.env.HOME || '', '.pi/agent/skills/pi-skills/browser-tools/node_modules/puppeteer-core'),
+    path.join(process.env.HOME || '', '.codex/skills/pi-skills/browser-tools/node_modules/puppeteer-core'),
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { return require(c); } catch (e) { /* try next */ }
+  }
+  console.error('ERROR: Could not load puppeteer-core. Run `npm install` in the perplexity-pro skill directory,');
+  console.error('       or set PUPPETEER_CORE_PATH to an existing puppeteer-core install.');
+  process.exit(1);
+}
+const puppeteer = loadPuppeteer();
+
+function log(msg) {
+  process.stderr.write('[perplexity] ' + msg + '\n');
+}
+
+function parseArgs(argv) {
+  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false };
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case '--brief': flags.brief = true; break;
+      case '--detailed': flags.detailed = true; break;
+      case '--chat': flags.chat = true; break;
+      case '--deep': flags.deep = true; break;
+      case '--computer': flags.computer = true; break;
+      case '--url':
+        i++;
+        if (i >= argv.length || argv[i].startsWith('--')) { console.error('ERROR: --url requires a URL argument'); process.exit(1); }
+        if (flags.url !== null) { console.error('ERROR: --url specified multiple times'); process.exit(1); }
+        try {
+          const parsed = new URL(argv[i]);
+          if (!['http:', 'https:'].includes(parsed.protocol)) { console.error('ERROR: --url must use http or https scheme'); process.exit(1); }
+        } catch { console.error('ERROR: --url value is not a valid URL'); process.exit(1); }
+        flags.url = argv[i];
+        break;
+      default: positional.push(argv[i]);
+    }
+  }
+  return { flags, query: positional.join(' ') };
+}
+
+function validateFlags(flags) {
+  if (flags.brief && flags.detailed) { console.error('ERROR: --brief and --detailed are mutually exclusive'); process.exit(1); }
+  if (flags.deep && flags.computer) { console.error('ERROR: --deep and --computer are mutually exclusive'); process.exit(1); }
+  if (flags.chat && flags.computer) { console.error('ERROR: --chat and --computer cannot be combined'); process.exit(1); }
+  if (flags.computer && flags.brief) { console.error('ERROR: --brief is not compatible with --computer mode'); process.exit(1); }
+}
+
+const CDP_URL = 'http://127.0.0.1:9222';
+const OUTPUT_DIR = process.env.PERPLEXITY_OUTPUT_DIR || '/tmp';
+const MAX_RETRIES = (() => { const v = parseInt(process.env.PERPLEXITY_RETRIES, 10); return Number.isFinite(v) && v >= 0 ? v : 2; })();
+
+function safeParseTimeout(envVar, defaultMs) {
+  const raw = process.env[envVar];
+  if (!raw) return defaultMs;
+  const v = parseInt(raw, 10);
+  if (!Number.isFinite(v) || v <= 0) { log('Warning: invalid ' + envVar + '="' + raw + '", using default ' + defaultMs + 'ms'); return defaultMs; }
+  return v;
+}
+
+function getTimeoutMs(flags) {
+  if (flags.computer) return safeParseTimeout('PERPLEXITY_COMPUTER_TIMEOUT', 30 * 60 * 1000);
+  if (flags.deep) return safeParseTimeout('PERPLEXITY_DEEP_TIMEOUT', 10 * 60 * 1000);
+  return safeParseTimeout('PERPLEXITY_TIMEOUT', 120000);
+}
+
+function buildQuery(rawQuery, flags) {
+  let q = rawQuery;
+  if (flags.brief) q += ' (Answer briefly in 2-3 sentences.)';
+  if (flags.detailed) q += ' (Provide a detailed, comprehensive answer with examples.)';
+  if (flags.url) q = flags.url + ' -- ' + q;
+  return q;
+}
+
+function getModeLabel(flags) {
+  if (flags.computer) return 'computer';
+  if (flags.deep) return 'deep';
+  if (flags.chat) return 'chat';
+  return 'standard';
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function findInput(page) {
+  const selectors = [
+    'textarea[placeholder*="Ask"], textarea[placeholder*="ask"], textarea[placeholder*="Type"]',
+    '[contenteditable="true"].overflow-auto',
+    '[contenteditable="true"]',
+  ];
+  for (const sel of selectors) {
+    const el = await page.$(sel);
+    if (el) { const visible = await el.evaluate(e => e.offsetHeight > 0); if (visible) return el; }
+  }
+  return null;
+}
+
+async function findFollowUpInput(page) {
+  const selectors = [
+    'textarea[placeholder*="Follow"], textarea[placeholder*="follow"]',
+    'textarea[placeholder*="Ask"], textarea[placeholder*="ask"]',
+    '[contenteditable="true"].overflow-auto',
+    '[contenteditable="true"]',
+  ];
+  for (const sel of selectors) {
+    const els = await page.$$(sel);
+    for (let i = els.length - 1; i >= 0; i--) { const visible = await els[i].evaluate(e => e.offsetHeight > 0); if (visible) return els[i]; }
+  }
+  return null;
+}
+
+async function dismissModals(page) {
+  try {
+    const closeButtons = await page.$$('button[aria-label="Close"], button[aria-label="close"], button[aria-label="Dismiss"]');
+    for (const btn of closeButtons) {
+      const visible = await btn.evaluate(e => e.offsetHeight > 0);
+      if (visible) { await btn.click().catch(e => log('Warning: modal close click failed: ' + e.message)); await sleep(500); }
+    }
+  } catch (e) { log('Warning: modal dismissal failed: ' + e.message); }
+}
+
+// Puppeteer doesn't support :has-text(); use XPath/text matching helpers.
+async function clickByText(page, texts) {
+  return page.evaluate((texts) => {
+    const btns = Array.from(document.querySelectorAll('button, [role="button"], [role="option"], [role="menuitem"]'));
+    for (const t of texts) {
+      const el = btns.find(b => (b.innerText || '').trim().includes(t));
+      if (el) { el.click(); return true; }
+    }
+    return false;
+  }, texts);
+}
+
+// Find an element handle whose trimmed innerText matches one of `texts`.
+async function findHandleByText(page, selector, texts, exact) {
+  const handles = await page.$$(selector);
+  for (const h of handles) {
+    const t = (await h.evaluate(el => (el.innerText || '').trim())) || '';
+    for (const want of texts) {
+      if (exact ? t === want : t.includes(want)) return h;
+    }
+  }
+  return null;
+}
+
+async function toggleDeepResearch(page) {
+  // The mode selector is a Radix dropdown button (aria-haspopup="menu") next to
+  // the search box, labeled "Search" / "Research" / "Deep research". It only
+  // opens on a REAL pointer click (element-handle .click()), not synthetic JS click.
+  const modeBtn = await findHandleByText(
+    page, 'button[aria-haspopup="menu"]',
+    ['Search', 'Deep research', 'Research', '\u641c\u7d22', '\u6df1\u5ea6\u7814\u7a76'], true
+  );
+  if (!modeBtn) {
+    log('Warning: Could not find mode selector button - proceeding as standard search');
+    return false;
+  }
+
+  const curLabel = (await modeBtn.evaluate(el => (el.innerText || '').trim())) || '';
+  if (/deep research|\u6df1\u5ea6\u7814\u7a76/i.test(curLabel)) {
+    log('Deep Research already selected');
+    return true;
+  }
+
+  await modeBtn.click();
+  await sleep(1000);
+
+  const deepItem = await findHandleByText(
+    page, '[role="menuitemradio"], [role="menuitem"], [role="option"]',
+    ['Deep research', 'Deep Research', '\u6df1\u5ea6\u7814\u7a76'], false
+  );
+  if (!deepItem) {
+    log('Warning: Deep research option not found in menu - proceeding as standard search');
+    await page.keyboard.press('Escape').catch(() => {});
+    return false;
+  }
+  await deepItem.click();
+  await sleep(800);
+
+  const after = await page.evaluate(() => {
+    const b = Array.from(document.querySelectorAll('button[aria-haspopup="menu"]'))
+      .find(x => /search|deep research|research|\u641c\u7d22|\u6df1\u5ea6\u7814\u7a76/i.test((x.innerText || '').trim()));
+    return b ? (b.innerText || '').trim() : '';
+  });
+  if (/deep research|\u6df1\u5ea6\u7814\u7a76/i.test(after)) {
+    log('Deep Research mode enabled');
+    return true;
+  }
+  log('Warning: Deep Research toggle did not confirm (label="' + after + '")');
+  return false;
+}
+
+async function detectImageGeneration(page) {
+  return page.evaluate(() => {
+    const text = document.body.innerText || '';
+    if (/\d+\s*step\s*completed/i.test(text)) return true;
+    if (/\d+\s*step/i.test(text) && /generating\s*image/i.test(text)) return true;
+    if (/generating\s*image/i.test(text)) return true;
+    const stepEls = document.querySelectorAll('[class*="step"], [class*="Step"]');
+    for (const el of stepEls) {
+      if (el.innerText && /generat/i.test(el.innerText) && /image|photo|picture|illustration/i.test(el.innerText)) return true;
+    }
+    const imgs = document.querySelectorAll('img[alt*="generated"], img[alt*="Generated"]');
+    if (imgs.length > 0) return true;
+    const allImgs = document.querySelectorAll('img');
+    for (const img of allImgs) { if (img.src && img.src.includes('seedream')) return true; }
+    return false;
+  });
+}
+
+const IMAGE_FILTER_JS = `
+  function isRelevantImage(img) {
+    return img.naturalWidth > 200 && img.src &&
+      !img.src.startsWith('data:') &&
+      !img.src.includes('favicon') &&
+      !img.src.includes('logo') &&
+      !img.src.includes('avatar') &&
+      !img.src.includes('icon');
+  }
+`;
+
+async function waitAndDownloadImages(page, timeoutMs) {
+  try {
+    await page.waitForFunction(`
+      ${IMAGE_FILTER_JS}
+      (() => {
+        const imgs = document.querySelectorAll('img');
+        for (const img of imgs) { if (isRelevantImage(img) && (img.alt || '').length > 5) return true; }
+        return false;
+      })()
+    `, { timeout: Math.min(timeoutMs, 90000) });
+  } catch (e) { log('Warning: timed out waiting for generated images: ' + e.message); return []; }
+
+  await sleep(3000);
+
+  const imageUrls = await page.evaluate(`
+    ${IMAGE_FILTER_JS}
+    (() => {
+      const imgs = document.querySelectorAll('img');
+      const results = [];
+      for (const img of imgs) {
+        if (isRelevantImage(img)) results.push({ src: img.src, alt: img.alt || '', width: img.naturalWidth, height: img.naturalHeight });
+      }
+      const seen = new Set();
+      return results.filter(r => { const key = r.src.split('?')[0]; if (seen.has(key)) return false; seen.add(key); return true; });
+    })()
+  `);
+
+  const safeImages = imageUrls.filter(img => img.src.startsWith('https://'));
+  if (safeImages.length < imageUrls.length) log('Warning: filtered out ' + (imageUrls.length - safeImages.length) + ' non-https image URLs');
+
+  const downloaded = [];
+  const ts = Date.now();
+  for (let i = 0; i < safeImages.length; i++) {
+    try {
+      const dataUrl = await page.evaluate(async (url) => {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        return new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); });
+      }, safeImages[i].src);
+      const base64 = dataUrl.split(',')[1];
+      const ext = dataUrl.startsWith('data:image/png') ? 'png' : dataUrl.startsWith('data:image/webp') ? 'webp' : 'jpg';
+      const filepath = path.join(OUTPUT_DIR, 'perplexity-gen-' + ts + '-' + i + '.' + ext);
+      fs.writeFileSync(filepath, Buffer.from(base64, 'base64'));
+      downloaded.push({ path: filepath, alt: safeImages[i].alt, width: safeImages[i].width, height: safeImages[i].height });
+    } catch (e) { log('Warning: failed to download image ' + i + ': ' + e.message); }
+  }
+  return downloaded;
+}
+
+async function typeQuery(page, input, query) {
+  const oneLine = query.replace(/\s*\n+\s*/g, ' ').trim();
+  await input.click();
+  await sleep(300);
+  const tagName = await input.evaluate(el => el.tagName);
+  if (tagName === 'TEXTAREA' || tagName === 'INPUT') {
+    await input.evaluate((el, text) => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') ||
+                     Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      setter.set.call(el, text);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }, oneLine);
+  } else {
+    await input.evaluate(el => { el.focus(); el.innerText = ''; });
+    await page.evaluate((text) => {
+      const el = document.activeElement && document.activeElement.isContentEditable
+        ? document.activeElement
+        : document.querySelector('[contenteditable="true"]');
+      if (el) { el.focus(); document.execCommand('selectAll', false, null); document.execCommand('insertText', false, text); }
+    }, oneLine);
+  }
+  await sleep(200);
+  const got = await input.evaluate(el => (el.value !== undefined ? el.value : el.innerText) || '');
+  if (got.trim().length < Math.min(oneLine.length, 10)) {
+    log('Warning: input verification short (got ' + got.length + '/' + oneLine.length + ' chars), retrying type');
+    await input.type(oneLine, { delay: 10 });
+  }
+}
+
+async function waitForAnswer(page, timeoutMs, flags) {
+  const startTime = Date.now();
+  try {
+    await page.waitForFunction(() => /perplexity\.ai\/(search|thread|computer)\//.test(window.location.href), { timeout: 15000 }).catch(() => {});
+  } catch (e) {}
+
+  await sleep(5000);
+  let isImageGen = false;
+  try { isImageGen = await detectImageGeneration(page); } catch (e) { log('Warning: image detection failed: ' + e.message); }
+
+  if (!isImageGen) {
+    for (let i = 0; i < 12; i++) {
+      await sleep(3000);
+      try { isImageGen = await detectImageGeneration(page); } catch (e) { log('Warning: image detection poll failed: ' + e.message); }
+      if (isImageGen) break;
+      try {
+        const hasText = await page.evaluate(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el && (el.innerText || '').length > 20; });
+        if (hasText) break;
+      } catch {}
+    }
+  }
+
+  if (isImageGen) {
+    try {
+      await page.waitForFunction(() => {
+        const text = document.body.innerText || '';
+        const stepMatch = text.match(/(\d+)\s*step\s*completed/i);
+        if (!stepMatch) return false;
+        const generating = document.querySelector('[class*="loading"], [class*="spinner"], [class*="generating"]');
+        return !generating;
+      }, { timeout: Math.min(timeoutMs, 90000) });
+    } catch (e) { log('Warning: image generation wait timed out - proceeding'); }
+    await sleep(3000);
+  }
+
+  try {
+    await page.waitForFunction(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el && (el.innerText || '').length > 5; }, { timeout: isImageGen ? 10000 : Math.min(timeoutMs, 60000) });
+    let prev = '';
+    for (let i = 0; i < 10; i++) {
+      await sleep(1500);
+      try {
+        const cur = await page.evaluate(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el ? el.innerText : ''; });
+        if (cur === prev && cur.length > 5) break;
+        prev = cur;
+      } catch (e) { log('Warning: streaming poll failed: ' + e.message); }
+    }
+  } catch (e) { if (!isImageGen) await sleep(10000); }
+
+  let answerText = '';
+  try {
+    answerText = await page.evaluate(() => {
+      const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
+      for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) { const last = els[els.length - 1]; const text = last ? last.innerText : ''; if (text.length > 5) return text; }
+      }
+      return '';
+    });
+  } catch (e) { log('Warning: answer extraction failed: ' + e.message); }
+
+  if (answerText) return { text: answerText, isImageGen };
+
+  if (!isImageGen) {
+    let lastText = ''; let stableCount = 0;
+    while (Date.now() - startTime < timeoutMs) {
+      await sleep(2000);
+      let currentText = '';
+      try {
+        currentText = await page.evaluate(() => { const els = document.querySelectorAll('[class*="prose"], [class*="markdown"]'); if (els.length === 0) return ''; const l = els[els.length - 1]; return l ? l.innerText : ''; });
+      } catch (e) { log('Warning: stabilization poll failed: ' + e.message); continue; }
+      if (currentText && currentText === lastText && currentText.length > 10) { stableCount++; if (stableCount >= 2) return { text: currentText, isImageGen }; }
+      else { stableCount = 0; lastText = currentText; }
+    }
+    return { text: lastText || '', isImageGen };
+  }
+  return { text: answerText || '', isImageGen };
+}
+
+async function runQuery(flags, query, timeoutMs) {
+  let browser;
+  try {
+    browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null });
+
+    if (flags.chat) {
+      let perplexityPage = null;
+      const pages = await browser.pages();
+      for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
+      if (!perplexityPage) throw new Error('--chat requires an existing Perplexity search thread. No tab found with a /search/ or /thread/ URL.');
+      await perplexityPage.bringToFront();
+      const input = await findFollowUpInput(perplexityPage);
+      if (!input) throw new Error('Could not find follow-up input in existing thread');
+      await typeQuery(perplexityPage, input, query);
+      await sleep(500);
+      await perplexityPage.keyboard.press('Enter');
+      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags);
+      let generatedImages = [];
+      if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
+      const ts = Date.now();
+      let screenshotPath = null;
+      try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
+      return { query, answer: answer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
+    }
+
+    const pages = await browser.pages();
+    let perplexityPage = pages.find(p => { const url = p.url(); return url.includes('perplexity.ai') && !url.includes('count.perplexity') && !url.includes('service-worker') && !url.startsWith('blob:'); });
+    if (!perplexityPage) perplexityPage = await browser.newPage();
+    await perplexityPage.bringToFront();
+
+    if (flags.computer) {
+      await perplexityPage.goto('https://www.perplexity.ai/computer/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await sleep(3000);
+    } else {
+      await perplexityPage.goto('https://www.perplexity.ai/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await sleep(2000);
+    }
+
+    await dismissModals(perplexityPage);
+    if (flags.deep) await toggleDeepResearch(perplexityPage);
+
+    const urlBeforeSubmit = perplexityPage.url();
+
+    const input = await findInput(perplexityPage);
+    if (!input) {
+      try { const debugPath = path.join(OUTPUT_DIR, 'perplexity-debug-' + Date.now() + '.png'); await perplexityPage.screenshot({ path: debugPath }); log('Debug screenshot: ' + debugPath); } catch (e) { log('Warning: debug screenshot also failed: ' + e.message); }
+      throw new Error('Could not find Perplexity search input');
+    }
+
+    await typeQuery(perplexityPage, input, query);
+    await sleep(500);
+    await perplexityPage.keyboard.press('Enter');
+
+    if (!flags.computer) {
+      try {
+        await perplexityPage.waitForFunction(
+          (prev) => window.location.href !== prev && /perplexity\.ai\/(search|thread)\//.test(window.location.href),
+          { timeout: 20000 }, urlBeforeSubmit
+        );
+      } catch (e) { log('Warning: did not observe navigation to a new thread URL'); }
+    }
+
+    const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags);
+    let generatedImages = [];
+    if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
+
+    let images = [];
+    try { images = await perplexityPage.evaluate(() => { const imgs = document.querySelectorAll('[class*="prose"] img, [class*="markdown"] img, article img'); return Array.from(imgs).map(img => img.src).filter(src => src && !src.startsWith('data:')); }); } catch (e) { log('Warning: inline image extraction failed: ' + e.message); }
+
+    let sources = [];
+    try { sources = await perplexityPage.evaluate(() => { const links = document.querySelectorAll('[class*="source"] a, [class*="citation"] a'); return Array.from(links).slice(0, 10).map(a => ({ title: a.textContent ? a.textContent.trim() : '', url: a.href })).filter(s => s.url && !s.url.includes('perplexity.ai')); }); } catch (e) { log('Warning: source extraction failed: ' + e.message); }
+
+    const ts = Date.now();
+    let screenshotPath = null;
+    try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
+
+    return { query, answer: answer || (isImageGen ? '[Image generated - see generatedImages]' : '[No answer received]'), mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url() };
+  } finally {
+    if (browser) { try { await browser.disconnect(); } catch (e) {} }
+  }
+}
+
+async function main() {
+  const { flags, query } = parseArgs(process.argv.slice(2));
+  if (!query) { console.error('Usage: node perplexity-query.js [--brief|--detailed] [--chat|--deep|--computer] [--url <URL>] "your question"'); process.exit(1); }
+  validateFlags(flags);
+  const finalQuery = buildQuery(query, flags);
+  const timeoutMs = getTimeoutMs(flags);
+  const mode = getModeLabel(flags);
+  log('Mode: ' + mode + ' | Timeout: ' + timeoutMs + 'ms | Query: ' + query.substring(0, 80) + (query.length > 80 ? '...' : ''));
+  let lastError;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) { const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000); log('Retry ' + attempt + '/' + MAX_RETRIES + ' after ' + backoffMs + 'ms backoff...'); await sleep(backoffMs); }
+    try {
+      const result = await runQuery(flags, finalQuery, timeoutMs);
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    } catch (err) {
+      lastError = err;
+      log('Attempt ' + (attempt + 1) + ' failed: ' + err.message);
+      if (err.message.includes('--chat requires') || err.message.includes('Could not find follow-up') || err.message.includes('Could not connect') || err.message.includes('connect ECONNREFUSED')) break;
+    }
+  }
+  console.error('ERROR: All attempts failed. Last error: ' + (lastError ? lastError.message : 'unknown'));
+  process.exit(1);
+}
+
+main();

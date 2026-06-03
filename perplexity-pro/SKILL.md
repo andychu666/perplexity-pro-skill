@@ -1,0 +1,160 @@
+---
+name: perplexity-pro
+description: >
+  Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation (pi-adapted).
+  Use when (1) deep research with web citations needed, (2) questions where web_search
+  is insufficient, (3) image generation requests, (4) complex multi-step research queries,
+  (5) analyzing a specific URL, (6) continuing a conversation thread, (7) computer/tool-use tasks.
+  Flags: --brief, --detailed, --chat, --url, --deep, --computer.
+  Uses pi-managed Chrome browser (port 9222).
+---
+
+# Perplexity Pro (pi-adapted)
+
+Query Perplexity Pro via Chrome CDP browser automation using pi's Chrome instance on port 9222.
+
+## Prerequisites
+
+- Chrome running with remote debugging on `:9222`
+- Logged into Perplexity Pro account in Chrome
+- `puppeteer-core` available
+
+## Setup
+
+Run once before first use:
+
+```bash
+cd {baseDir} && npm install
+```
+
+If you already have the [browser-tools](https://github.com/badlogic/pi-skills/tree/main/browser-tools)
+skill installed, the script will reuse its `puppeteer-core` automatically and you can skip `npm install`.
+
+## Quick Start
+
+Start Chrome (if not running):
+```bash
+# Start headless Chrome
+mkdir -p ~/.cache/browser-tools
+google-chrome-stable \
+  --remote-debugging-port=9222 \
+  --user-data-dir=~/.cache/browser-tools \
+  --no-first-run --no-default-browser-check \
+  --no-sandbox --headless \
+  2>/dev/null &
+
+# Or with a visible display for login
+# Omit --headless if you have X11/DISPLAY setup
+```
+
+## Quick Query
+
+```bash
+node {baseDir}/scripts/perplexity-query.js "your question here"
+```
+
+## Flags
+
+| Flag | Description | Combinable with |
+|------|-------------|-----------------|
+| `--brief` | Append "Answer briefly in 2-3 sentences" | `--chat`, `--deep`, `--url` |
+| `--detailed` | Append "Provide a detailed, comprehensive answer" | `--chat`, `--deep`, `--computer`, `--url` |
+| `--chat` | Continue in existing Perplexity thread (requires active `/search/` or `/thread/` tab) | `--brief`, `--detailed`, `--url` |
+| `--url <URL>` | Prepend a URL for Perplexity to analyze (must be http/https) | All except conflicts |
+| `--deep` | Enable Deep Research mode (extended timeout: 10 min) | `--brief`, `--detailed`, `--chat`, `--url` |
+| `--computer` | Use Computer mode at `/computer/new` (extended timeout: 30 min) | `--detailed`, `--url` |
+
+### Flag Conflicts (mutually exclusive)
+
+- `--brief` + `--detailed` — contradictory instructions
+- `--deep` + `--computer` — different Perplexity modes
+- `--chat` + `--computer` — chat requires existing thread, computer starts fresh
+- `--brief` + `--computer` — computer mode produces long-form output
+
+## Examples
+
+```bash
+SKILL_DIR={baseDir}
+
+# Standard query
+node $SKILL_DIR/scripts/perplexity-query.js "What is quantum computing?"
+
+# Brief answer
+node $SKILL_DIR/scripts/perplexity-query.js --brief "Explain Docker containers"
+
+# Detailed research
+node $SKILL_DIR/scripts/perplexity-query.js --detailed "Compare React vs Vue in 2026"
+
+# Analyze a URL
+node $SKILL_DIR/scripts/perplexity-query.js --url https://example.com/article "Summarize this article"
+
+# Deep Research (10 min timeout)
+node $SKILL_DIR/scripts/perplexity-query.js --deep "History of semiconductor manufacturing"
+
+# Computer mode (30 min timeout)
+node $SKILL_DIR/scripts/perplexity-query.js --computer "Create a comparison table of top 5 cloud providers"
+
+# Continue conversation in existing thread
+node $SKILL_DIR/scripts/perplexity-query.js --chat "What about the security implications?"
+
+# Deep Research with URL
+node $SKILL_DIR/scripts/perplexity-query.js --deep --url https://arxiv.org/abs/1234.5678 "Analyze this paper"
+```
+
+## Output JSON
+
+```json
+{
+  "query": "...",
+  "answer": "...",
+  "mode": "standard|brief|detailed|chat|deep|computer",
+  "isImageGeneration": false,
+  "generatedImages": [{"path": "/tmp/perplexity-gen-1710000000000-0.png", "alt": "...", "width": 2848, "height": 1600}],
+  "images": [],
+  "sources": [{"title": "...", "url": "..."}],
+  "screenshot": "/tmp/perplexity-result-1710000000000.png",
+  "url": "https://www.perplexity.ai/search/..."
+}
+```
+
+For image generation queries, `isImageGeneration` is `true` and images are auto-downloaded to `generatedImages[].path`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PERPLEXITY_TIMEOUT` | `120000` | Max wait for standard answer (ms) |
+| `PERPLEXITY_DEEP_TIMEOUT` | `600000` | Max wait for Deep Research (ms) |
+| `PERPLEXITY_COMPUTER_TIMEOUT` | `1800000` | Max wait for Computer mode (ms) |
+| `PERPLEXITY_OUTPUT_DIR` | `/tmp` | Screenshot/image output directory |
+| `PERPLEXITY_RETRIES` | `2` | Max retry attempts with exponential backoff |
+
+## Differences from the OpenClaw Original
+
+This is a port of [andychu666/perplexity-pro-skill-old](https://github.com/andychu666/perplexity-pro-skill-old)
+(built for OpenClaw) to the pi / Claude Code skill format:
+
+- Uses `puppeteer-core` instead of `playwright-core` (resolved from this skill's `node_modules`, or reused from the browser-tools skill)
+- Connects to Chrome at `http://127.0.0.1:9222` instead of `:18800`
+- No OpenClaw dependency
+- Headless-friendly: Chrome started with `--headless` works (log into Perplexity at least once interactively first)
+- Deep Research toggle rewritten for Perplexity's current Radix dropdown UI
+
+## Usage Guidelines
+
+- Start with `web_search` for quick facts — escalate to Perplexity for depth
+- Perplexity is best for: multi-source synthesis, current events, citation-heavy answers
+- Use `--brief` for quick factual lookups, `--detailed` for research
+- Use `--deep` for complex topics requiring extensive research
+- Use `--computer` for tasks that need Perplexity's tool-use capabilities
+- Use `--chat` to follow up on a previous query in the same thread
+- Use `--url` to ask Perplexity to analyze a specific webpage
+
+## Troubleshooting
+
+- **"Could not connect to browser"**: Make sure Chrome is running on `:9222`. Check with `curl -s http://127.0.0.1:9222/json/version`.
+- **"Could not find search input"**: Perplexity UI may have changed; check debug screenshot at `/tmp/perplexity-debug-*.png`.
+- **Timeout with no answer**: Answer rendered but extraction failed; check result screenshot.
+- **Not logged in**: You must log into Perplexity at least once. If running headless, start Chrome without `--headless` first, log in, then restart with `--headless` (the profile persists).
+- **"--chat requires existing thread"**: Navigate to a Perplexity search page first, then use `--chat`.
+- **Deep Research**: The mode selector is a Radix dropdown button (`aria-haspopup="menu"`) next to the search box. It only opens on a real pointer click, so the script uses a Puppeteer element-handle click, then selects the "Deep research" `menuitemradio`. The script verifies the mode actually switched and logs `Deep Research mode enabled` on success. If Perplexity changes the menu label/locale, update the text lists in `toggleDeepResearch()`.

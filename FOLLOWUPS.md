@@ -1,7 +1,45 @@
 # Follow-ups
 
-Tracked items from the GitNexus-assisted review of PR #1 (`--discover` mode).
-Severe/correctness issues were fixed in the PR; the items below are deferred.
+Tracked items from the GitNexus-assisted reviews of the `--discover` mode (PR #1)
+and the `--help`/unknown-flag fix (PR #2). Severe/correctness issues were fixed in
+the PRs; the items below are deferred.
+
+---
+
+## PR #2 — `--help` / unknown-flag handling
+
+GitNexus review: `parseArgs` and `main` both **LOW** risk (only the test file and
+the CLI entrypoint are upstream callers; no external/production consumers). Aggregate
+risk reported MEDIUM only because `main` participates in indexed execution flows.
+
+### Fixed in PR #2
+
+- **[SEVERE] Unknown/`--help` flags were sent to Perplexity as query text.** The
+  arg-parser `default:` case treated any unrecognized token as part of the query,
+  so `--help` (and typos like `--breif`) were submitted as prompts. Fixed by
+  rejecting tokens matching `--xxx` / `-x` with exit 1, and handling `-h`/`--help`
+  (prints usage, exits 0 before any browser/network call).
+- **[SEVERE follow-on] Legitimate queries containing dash-prefixed words were
+  wrongly rejected.** Once unknown flags were rejected, an unquoted query such as
+  `explain the --verbose flag` would error. Fixed with a POSIX `--` end-of-options
+  separator: everything after `--` is treated as query text verbatim. Documented in
+  `HELP_TEXT` and the unknown-option error message.
+- **[TEST] Unknown flag must not reach the network.** Added an explicit test
+  asserting an unknown option exits 1 with no `Could not connect`/retry/`Mode:`
+  output, plus tests for the `--` separator and help-on-stdout. Suite now 30 cases
+  (was 22).
+
+### Deferred from PR #2
+
+- **[LOW] Lone `-` and negative-number tokens.** `/^-[a-zA-Z]/` does not match a
+  bare `-` (treated as query text) nor negative numbers like `-5` (also query
+  text, since they don't start with a letter). Both are harmless in practice and
+  the `--` separator covers any intentional dash-prefixed query. No action unless
+  a real use case appears.
+
+---
+
+## PR #1 — `--discover` mode
 
 ## Review summary (GitNexus)
 

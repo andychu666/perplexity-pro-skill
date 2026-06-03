@@ -18,13 +18,13 @@ const path = require('node:path');
 const SCRIPT = path.join(__dirname, '..', 'scripts', 'perplexity-query.js');
 const { parseArgs, buildQuery, getModeLabel, safeParseTimeout, DISCOVER_ALIASES } = require(SCRIPT);
 
-// Run the CLI in a subprocess; return { code, stderr }.
+// Run the CLI in a subprocess; return { code, stdout, stderr }.
 function runCli(args) {
   try {
-    execFileSync(process.execPath, [SCRIPT, ...args], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 10000 });
-    return { code: 0, stderr: '' };
+    const stdout = execFileSync(process.execPath, [SCRIPT, ...args], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 });
+    return { code: 0, stdout: (stdout || '').toString(), stderr: '' };
   } catch (e) {
-    return { code: e.status == null ? -1 : e.status, stderr: (e.stderr || '').toString() };
+    return { code: e.status == null ? -1 : e.status, stdout: (e.stdout || '').toString(), stderr: (e.stderr || '').toString() };
   }
 }
 
@@ -163,4 +163,27 @@ test('CLI: no query and no mode prints usage and exits 1', () => {
   const r = runCli([]);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /Usage:/);
+});
+
+test('CLI: --help prints usage and exits 0', () => {
+  const r = runCli(['--help']);
+  assert.equal(r.code, 0);
+  assert.match(r.stdout, /Usage:/);
+});
+
+test('CLI: -h prints usage and exits 0', () => {
+  const r = runCli(['-h']);
+  assert.equal(r.code, 0);
+  assert.match(r.stdout, /Usage:/);
+});
+
+test('CLI: unknown flag exits 1 and does not run query', () => {
+  const r = runCli(['--bogus', 'hello']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /unknown option "--bogus"/);
+});
+
+test('parseArgs: --help sets help flag without consuming query', () => {
+  const { flags } = parseArgs(['--help', 'ignored']);
+  assert.equal(flags.help, true);
 });

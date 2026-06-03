@@ -44,11 +44,28 @@ const DISCOVER_CATEGORIES = ['for-you', 'top', 'tech', 'finance', 'arts', 'sport
 // Friendly aliases -> Perplexity Discover slugs
 const DISCOVER_ALIASES = { you: 'for-you', 'for-you': 'for-you', foryou: 'for-you', forme: 'for-you' };
 
+const HELP_TEXT = `Usage:
+  perplexity-query.js [options] "your question"
+  perplexity-query.js --discover [category|all] [--limit N]
+
+Options:
+  --brief            Append "Answer briefly in 2-3 sentences"
+  --detailed         Append "Provide a detailed, comprehensive answer"
+  --chat             Continue in existing Perplexity thread
+  --url <URL>        Prepend a URL for Perplexity to analyze (http/https)
+  --deep             Enable Deep Research mode (10 min timeout)
+  --computer         Use Computer mode (30 min timeout)
+  --discover [cat]   List Discover news headlines (default category: top)
+  --limit N          Number of discover headlines to return (default 10)
+  -h, --help         Show this help and exit`;
+
 function parseArgs(argv) {
-  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, limit: 10 };
+  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, limit: 10, help: false };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
+      case '-h':
+      case '--help': flags.help = true; break;
       case '--brief': flags.brief = true; break;
       case '--detailed': flags.detailed = true; break;
       case '--chat': flags.chat = true; break;
@@ -83,7 +100,13 @@ function parseArgs(argv) {
         } catch { console.error('ERROR: --url value is not a valid URL'); process.exit(1); }
         flags.url = argv[i];
         break;
-      default: positional.push(argv[i]);
+      default:
+        // Reject unknown flags rather than silently sending them to Perplexity.
+        if (argv[i].startsWith('--') || /^-[a-zA-Z]/.test(argv[i])) {
+          console.error('ERROR: unknown option "' + argv[i] + '"\n\n' + HELP_TEXT);
+          process.exit(1);
+        }
+        positional.push(argv[i]);
     }
   }
   return { flags, query: positional.join(' ') };
@@ -575,6 +598,8 @@ async function runDiscover(category, limit) {
 
 async function main() {
   const { flags, query } = parseArgs(process.argv.slice(2));
+
+  if (flags.help) { console.log(HELP_TEXT); process.exit(0); }
 
   // Discover mode: list news headlines by category (no query needed)
   if (flags.discover) {

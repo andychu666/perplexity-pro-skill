@@ -49,15 +49,20 @@ function parseArgs(argv) {
       case '--deep': flags.deep = true; break;
       case '--computer': flags.computer = true; break;
       case '--discover': {
-        i++;
-        let cat = (i < argv.length && !argv[i].startsWith('--')) ? argv[i] : 'top';
-        cat = (DISCOVER_ALIASES[cat.toLowerCase()] || cat.toLowerCase());
-        flags.discover = cat;
+        // Only consume the next token as the category if it's not another flag.
+        let cat = 'top';
+        if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
+          cat = argv[++i];
+        }
+        flags.discover = DISCOVER_ALIASES[cat.toLowerCase()] || cat.toLowerCase();
         break;
       }
       case '--limit': {
-        i++;
-        const n = parseInt(argv[i], 10);
+        if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) {
+          console.error('ERROR: --limit requires a positive integer');
+          process.exit(1);
+        }
+        const n = parseInt(argv[++i], 10);
         if (!Number.isFinite(n) || n <= 0) { console.error('ERROR: --limit requires a positive integer'); process.exit(1); }
         flags.limit = n;
         break;
@@ -507,14 +512,13 @@ async function scrapeDiscoverCategory(page, category, limit) {
     await page.evaluate(() => window.scrollTo(0, 0));
     await sleep(500);
   }
-  const stories = await page.evaluate((cat) => {
+  const stories = await page.evaluate(() => {
     const out = [];
     const seen = new Set();
     for (const a of Array.from(document.querySelectorAll('a[href*="/discover/"]'))) {
       const href = a.getAttribute('href') || '';
       // story links look like /discover/<cat>/<slug-with-id>; skip the bare tab link
-      const m = href.match(/^\/discover\/([a-z-]+)\/([^/?#]+)/);
-      if (!m) continue;
+      if (!/^\/discover\/[a-z-]+\/[^/?#]+/.test(href)) continue;
       const raw = (a.innerText || '').trim();
       if (raw.length < 12) continue;
       // First line is the title; remaining lines hold meta (published / N sources / summary)
@@ -534,7 +538,7 @@ async function scrapeDiscoverCategory(page, category, limit) {
       });
     }
     return out;
-  }, category);
+  });
   return stories.slice(0, limit);
 }
 

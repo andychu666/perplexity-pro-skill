@@ -28,7 +28,13 @@ function loadPuppeteer() {
   console.error('       or set PUPPETEER_CORE_PATH to an existing puppeteer-core install.');
   process.exit(1);
 }
-const puppeteer = loadPuppeteer();
+// Lazy: only load puppeteer-core when a browser is actually needed, so the
+// module can be require()'d for unit testing pure helpers without Chrome.
+let _puppeteer = null;
+function puppeteerLib() {
+  if (!_puppeteer) _puppeteer = loadPuppeteer();
+  return _puppeteer;
+}
 
 function log(msg) {
   process.stderr.write('[perplexity] ' + msg + '\n');
@@ -421,7 +427,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
 async function runQuery(flags, query, timeoutMs) {
   let browser;
   try {
-    browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null });
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
 
     if (flags.chat) {
       let perplexityPage = null;
@@ -545,7 +551,7 @@ async function scrapeDiscoverCategory(page, category, limit) {
 async function runDiscover(category, limit) {
   let browser;
   try {
-    browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null });
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
     const pages = await browser.pages();
     let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
     await page.bringToFront();
@@ -610,4 +616,18 @@ async function main() {
   process.exit(1);
 }
 
-main();
+// Only run the CLI when executed directly (not when require()'d by tests).
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs,
+  validateFlags,
+  buildQuery,
+  getModeLabel,
+  getTimeoutMs,
+  safeParseTimeout,
+  DISCOVER_CATEGORIES,
+  DISCOVER_ALIASES,
+};

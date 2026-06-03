@@ -50,12 +50,17 @@ Ukraine cede territory"). Each category de-dups internally but not globally.
 - **Action:** for `all`, optionally annotate cross-category duplicates or expose a
   `--unique` flag.
 
-### 5. [LOW] No automated tests
-`parseArgs` now has non-trivial flag-peeking logic that was the source of the severe
-bug. There is currently no test harness in the repo.
-- **Action:** add a minimal unit test for `parseArgs` covering: category default,
-  aliases, `--limit` before/after `--discover`, missing/invalid `--limit`, and
-  flag-adjacency edge cases. Export `parseArgs` for testability.
+### 5. [LOW] No automated tests — ✅ DONE
+`parseArgs` had non-trivial flag-peeking logic that was the source of the severe
+bug, with no test harness in the repo.
+- **Resolved:** added `perplexity-pro/test/parseArgs.test.js` (Node built-in
+  `node:test`, zero deps). 22 cases covering category default, aliases,
+  lowercasing, `--limit` before/after `--discover`, the swallowed-flag regression,
+  positional leakage, `--url` consumption, `buildQuery`/`getModeLabel`/
+  `safeParseTimeout`, and all `process.exit(1)` validation paths (run via
+  subprocess). The script now exports its pure helpers and guards `main()` with
+  `require.main === module`; `puppeteer-core` loads lazily so the module can be
+  required without Chrome. Run with `npm test`.
 
 ### 6. [INFO] GitNexus graph-risk vs. real risk
 `detect-changes` reported MEDIUM largely because Markdown headings in `SKILL.md` are

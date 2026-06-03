@@ -31,6 +31,15 @@ cd {baseDir} && npm install
 If you already have the [browser-tools](https://github.com/badlogic/pi-skills/tree/main/browser-tools)
 skill installed, the script will reuse its `puppeteer-core` automatically and you can skip `npm install`.
 
+## Tests
+
+Pure CLI/arg-parsing logic is covered by zero-dependency unit tests (Node's
+built-in `node:test`). No browser required:
+
+```bash
+cd {baseDir} && npm test
+```
+
 ## Quick Start
 
 Start Chrome (if not running):

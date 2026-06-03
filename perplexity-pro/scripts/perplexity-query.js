@@ -426,12 +426,13 @@ async function waitForAnswer(page, timeoutMs, flags) {
     return best;
   });
 
-  // Detect whether Perplexity is still actively generating the answer. While
-  // streaming, a stop button / loading indicator is present; once done it turns
-  // into a copy/share/rewrite toolbar. Treat "still generating" as not-stable so
-  // we never extract a half-streamed answer.
+  // Best-effort hint: is Perplexity still actively streaming the answer? When a
+  // "stop generating" control is present we are definitely still streaming. This
+  // is used ONLY to confirm completion faster -- it is never required to be false
+  // before we accept a stable answer, because the heuristic can yield false
+  // positives (persistent skeleton loaders, locale-specific labels) that would
+  // otherwise pin polling open until the full timeout.
   const isGenerating = () => page.evaluate(() => {
-    if (document.querySelector('[class*="loading"], [class*="spinner"], [class*="animate-pulse"]')) return true;
     const stop = Array.from(document.querySelectorAll('button[aria-label], [data-testid]')).some(el => {
       const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase();
       return label.includes('stop');
@@ -443,15 +444,18 @@ async function waitForAnswer(page, timeoutMs, flags) {
     await page.waitForFunction(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el && (el.innerText || '').length > 5; }, { timeout: isImageGen ? 10000 : Math.min(timeoutMs, 60000) });
   } catch (e) { if (!isImageGen) await sleep(10000); }
 
-  // Streaming-completion poll: require the text to stop growing AND stay identical
-  // for several consecutive polls (and not be in a "generating" state) before we
-  // accept it. This prevents truncated answers on long, list-heavy responses that
-  // briefly pause mid-stream.
+  // Streaming-completion poll: accept the answer once its text stops growing and
+  // stays identical across several consecutive polls. This prevents truncated
+  // answers on long, list-heavy responses that briefly pause mid-stream. The
+  // "still generating" signal lets us confirm completion sooner (fewer stable
+  // polls) but is never required, so a flaky heuristic can't pin us to the full
+  // timeout.
   if (isImageGen) {
     return { text: await extractText(), isImageGen };
   }
 
-  const REQUIRED_STABLE = 4;   // consecutive identical polls required
+  const STABLE_WITH_HINT = 2;   // stable polls needed when UI confirms not-generating
+  const STABLE_NO_HINT = 5;     // stable polls needed without that confirmation
   const POLL_MS = 1500;
   let prev = '';
   let stableCount = 0;
@@ -461,11 +465,12 @@ async function waitForAnswer(page, timeoutMs, flags) {
     let cur = '';
     try { cur = await extractText(); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
     if (cur.length > best.length) best = cur;
-    let generating = false;
-    try { generating = await isGenerating(); } catch (e) {}
-    if (cur.length > 5 && cur === prev && !generating) {
+    if (cur.length > 5 && cur === prev) {
       stableCount++;
-      if (stableCount >= REQUIRED_STABLE) break;
+      let generating = false;
+      try { generating = await isGenerating(); } catch (e) {}
+      const needed = generating ? STABLE_NO_HINT : STABLE_WITH_HINT;
+      if (stableCount >= needed) break;
     } else {
       stableCount = 0;
       prev = cur;

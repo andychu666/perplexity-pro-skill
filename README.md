@@ -6,9 +6,9 @@ with citations, Deep Research, URL analysis, image generation, and conversation 
 
 Compatible with pi, Claude Code, Codex CLI, Amp, and Droid.
 
-This is a port of [andychu666/perplexity-pro-skill-old](https://github.com/andychu666/perplexity-pro-skill-old)
-(originally built for OpenClaw) to the [badlogic/pi-skills](https://github.com/badlogic/pi-skills)
-format, using `puppeteer-core` and Chrome on port `9222`.
+This is a port of an earlier Perplexity Pro skill (originally built for OpenClaw) to the
+[badlogic/pi-skills](https://github.com/badlogic/pi-skills) format, using `puppeteer-core`
+and Chrome on port `9222`.
 
 ## Installation
 

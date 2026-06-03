@@ -175,8 +175,7 @@ For image generation queries, `isImageGeneration` is `true` and images are auto-
 
 ## Differences from the OpenClaw Original
 
-This is a port of [andychu666/perplexity-pro-skill-old](https://github.com/andychu666/perplexity-pro-skill-old)
-(built for OpenClaw) to the pi / Claude Code skill format:
+This is a port of an earlier Perplexity Pro skill (built for OpenClaw) to the pi / Claude Code skill format:
 
 - Uses `puppeteer-core` instead of `playwright-core` (resolved from this skill's `node_modules`, or reused from the browser-tools skill)
 - Connects to Chrome at `http://127.0.0.1:9222` instead of `:18800`

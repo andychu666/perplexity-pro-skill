@@ -408,47 +408,75 @@ async function waitForAnswer(page, timeoutMs, flags) {
     await sleep(3000);
   }
 
+  // Extract the most complete answer text from the page. Perplexity streams the
+  // answer into one or more [class*="prose"] blocks; the LAST block is not always
+  // the answer (it can be a short trailing/related block), so pick the LONGEST
+  // block, which is the full answer body.
+  const extractText = () => page.evaluate(() => {
+    const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
+    let best = '';
+    for (const sel of selectors) {
+      const els = Array.from(document.querySelectorAll(sel));
+      for (const el of els) {
+        const text = (el && el.innerText) ? el.innerText : '';
+        if (text.length > best.length) best = text;
+      }
+      if (best.length > 5) break;
+    }
+    return best;
+  });
+
+  // Detect whether Perplexity is still actively generating the answer. While
+  // streaming, a stop button / loading indicator is present; once done it turns
+  // into a copy/share/rewrite toolbar. Treat "still generating" as not-stable so
+  // we never extract a half-streamed answer.
+  const isGenerating = () => page.evaluate(() => {
+    if (document.querySelector('[class*="loading"], [class*="spinner"], [class*="animate-pulse"]')) return true;
+    const stop = Array.from(document.querySelectorAll('button[aria-label], [data-testid]')).some(el => {
+      const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('data-testid') || '')).toLowerCase();
+      return label.includes('stop');
+    });
+    return stop;
+  }).catch(() => false);
+
   try {
     await page.waitForFunction(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el && (el.innerText || '').length > 5; }, { timeout: isImageGen ? 10000 : Math.min(timeoutMs, 60000) });
-    let prev = '';
-    for (let i = 0; i < 10; i++) {
-      await sleep(1500);
-      try {
-        const cur = await page.evaluate(() => { const el = document.querySelector('[class*="prose"], [class*="markdown"]'); return el ? el.innerText : ''; });
-        if (cur === prev && cur.length > 5) break;
-        prev = cur;
-      } catch (e) { log('Warning: streaming poll failed: ' + e.message); }
-    }
   } catch (e) { if (!isImageGen) await sleep(10000); }
 
-  let answerText = '';
-  try {
-    answerText = await page.evaluate(() => {
-      const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
-      for (const sel of selectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) { const last = els[els.length - 1]; const text = last ? last.innerText : ''; if (text.length > 5) return text; }
-      }
-      return '';
-    });
-  } catch (e) { log('Warning: answer extraction failed: ' + e.message); }
-
-  if (answerText) return { text: answerText, isImageGen };
-
-  if (!isImageGen) {
-    let lastText = ''; let stableCount = 0;
-    while (Date.now() - startTime < timeoutMs) {
-      await sleep(2000);
-      let currentText = '';
-      try {
-        currentText = await page.evaluate(() => { const els = document.querySelectorAll('[class*="prose"], [class*="markdown"]'); if (els.length === 0) return ''; const l = els[els.length - 1]; return l ? l.innerText : ''; });
-      } catch (e) { log('Warning: stabilization poll failed: ' + e.message); continue; }
-      if (currentText && currentText === lastText && currentText.length > 10) { stableCount++; if (stableCount >= 2) return { text: currentText, isImageGen }; }
-      else { stableCount = 0; lastText = currentText; }
-    }
-    return { text: lastText || '', isImageGen };
+  // Streaming-completion poll: require the text to stop growing AND stay identical
+  // for several consecutive polls (and not be in a "generating" state) before we
+  // accept it. This prevents truncated answers on long, list-heavy responses that
+  // briefly pause mid-stream.
+  if (isImageGen) {
+    return { text: await extractText(), isImageGen };
   }
-  return { text: answerText || '', isImageGen };
+
+  const REQUIRED_STABLE = 4;   // consecutive identical polls required
+  const POLL_MS = 1500;
+  let prev = '';
+  let stableCount = 0;
+  let best = '';
+  while (Date.now() - startTime < timeoutMs) {
+    await sleep(POLL_MS);
+    let cur = '';
+    try { cur = await extractText(); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
+    if (cur.length > best.length) best = cur;
+    let generating = false;
+    try { generating = await isGenerating(); } catch (e) {}
+    if (cur.length > 5 && cur === prev && !generating) {
+      stableCount++;
+      if (stableCount >= REQUIRED_STABLE) break;
+    } else {
+      stableCount = 0;
+      prev = cur;
+    }
+  }
+
+  // Final read: take the best (longest) text we have observed.
+  let finalText = '';
+  try { finalText = await extractText(); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
+  if (finalText.length < best.length) finalText = best;
+  return { text: finalText || best || '', isImageGen };
 }
 
 async function runQuery(flags, query, timeoutMs) {

@@ -34,8 +34,12 @@ function log(msg) {
   process.stderr.write('[perplexity] ' + msg + '\n');
 }
 
+const DISCOVER_CATEGORIES = ['for-you', 'top', 'tech', 'finance', 'arts', 'sports', 'entertainment'];
+// Friendly aliases -> Perplexity Discover slugs
+const DISCOVER_ALIASES = { you: 'for-you', 'for-you': 'for-you', foryou: 'for-you', forme: 'for-you' };
+
 function parseArgs(argv) {
-  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false };
+  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, limit: 10 };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
@@ -44,6 +48,20 @@ function parseArgs(argv) {
       case '--chat': flags.chat = true; break;
       case '--deep': flags.deep = true; break;
       case '--computer': flags.computer = true; break;
+      case '--discover': {
+        i++;
+        let cat = (i < argv.length && !argv[i].startsWith('--')) ? argv[i] : 'top';
+        cat = (DISCOVER_ALIASES[cat.toLowerCase()] || cat.toLowerCase());
+        flags.discover = cat;
+        break;
+      }
+      case '--limit': {
+        i++;
+        const n = parseInt(argv[i], 10);
+        if (!Number.isFinite(n) || n <= 0) { console.error('ERROR: --limit requires a positive integer'); process.exit(1); }
+        flags.limit = n;
+        break;
+      }
       case '--url':
         i++;
         if (i >= argv.length || argv[i].startsWith('--')) { console.error('ERROR: --url requires a URL argument'); process.exit(1); }
@@ -477,9 +495,95 @@ async function runQuery(flags, query, timeoutMs) {
   }
 }
 
+// ---
+// Discover feed: scrape headlines for a category (top|tech|finance|arts|sports|entertainment|for-you)
+// ---
+async function scrapeDiscoverCategory(page, category, limit) {
+  await page.goto('https://www.perplexity.ai/discover/' + category, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await sleep(3500);
+  // Lazy-load: scroll a bit to pull in more cards if a high limit is requested.
+  if (limit > 8) {
+    for (let i = 0; i < 3; i++) { await page.evaluate(() => window.scrollBy(0, window.innerHeight)); await sleep(900); }
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await sleep(500);
+  }
+  const stories = await page.evaluate((cat) => {
+    const out = [];
+    const seen = new Set();
+    for (const a of Array.from(document.querySelectorAll('a[href*="/discover/"]'))) {
+      const href = a.getAttribute('href') || '';
+      // story links look like /discover/<cat>/<slug-with-id>; skip the bare tab link
+      const m = href.match(/^\/discover\/([a-z-]+)\/([^/?#]+)/);
+      if (!m) continue;
+      const raw = (a.innerText || '').trim();
+      if (raw.length < 12) continue;
+      // First line is the title; remaining lines hold meta (published / N sources / summary)
+      const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+      const title = lines[0];
+      const meta = lines.slice(1).join(' ');
+      const sourcesMatch = meta.match(/(\d+)\s*sources?/i);
+      const publishedMatch = raw.match(/Published\s*\n?\s*([^\n]+)/i);
+      const key = href.split('?')[0];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        title,
+        url: 'https://www.perplexity.ai' + href,
+        sources: sourcesMatch ? parseInt(sourcesMatch[1], 10) : null,
+        published: publishedMatch ? publishedMatch[1].trim() : null,
+      });
+    }
+    return out;
+  }, category);
+  return stories.slice(0, limit);
+}
+
+async function runDiscover(category, limit) {
+  let browser;
+  try {
+    browser = await puppeteer.connect({ browserURL: CDP_URL, defaultViewport: null });
+    const pages = await browser.pages();
+    let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
+    await page.bringToFront();
+
+    const categories = category === 'all' ? DISCOVER_CATEGORIES : [category];
+    const result = { mode: 'discover', generatedAt: new Date().toISOString(), categories: {} };
+    for (const cat of categories) {
+      log('Discover: scraping /' + cat);
+      try {
+        result.categories[cat] = await scrapeDiscoverCategory(page, cat, limit);
+      } catch (e) {
+        log('Warning: failed to scrape ' + cat + ': ' + e.message);
+        result.categories[cat] = [];
+      }
+    }
+    return result;
+  } finally {
+    if (browser) { try { await browser.disconnect(); } catch (e) {} }
+  }
+}
+
 async function main() {
   const { flags, query } = parseArgs(process.argv.slice(2));
-  if (!query) { console.error('Usage: node perplexity-query.js [--brief|--detailed] [--chat|--deep|--computer] [--url <URL>] "your question"'); process.exit(1); }
+
+  // Discover mode: list news headlines by category (no query needed)
+  if (flags.discover) {
+    if (flags.discover !== 'all' && !DISCOVER_CATEGORIES.includes(flags.discover)) {
+      console.error('ERROR: unknown discover category "' + flags.discover + '". Valid: ' + DISCOVER_CATEGORIES.join(', ') + ', all (use "you" for for-you)');
+      process.exit(1);
+    }
+    log('Mode: discover | Category: ' + flags.discover + ' | Limit: ' + flags.limit);
+    try {
+      const result = await runDiscover(flags.discover, flags.limit);
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    } catch (err) {
+      console.error('ERROR: discover failed: ' + err.message);
+      process.exit(1);
+    }
+  }
+
+  if (!query) { console.error('Usage: node perplexity-query.js [--brief|--detailed] [--chat|--deep|--computer] [--url <URL>] "your question"\n       node perplexity-query.js --discover [category|all] [--limit N]'); process.exit(1); }
   validateFlags(flags);
   const finalQuery = buildQuery(query, flags);
   const timeoutMs = getTimeoutMs(flags);

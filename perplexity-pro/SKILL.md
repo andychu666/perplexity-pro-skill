@@ -5,7 +5,8 @@ description: >
   Use when (1) deep research with web citations needed, (2) questions where web_search
   is insufficient, (3) image generation requests, (4) complex multi-step research queries,
   (5) analyzing a specific URL, (6) continuing a conversation thread, (7) computer/tool-use tasks.
-  Flags: --brief, --detailed, --chat, --url, --deep, --computer.
+  (8) browsing the Discover news feed by category.
+  Flags: --brief, --detailed, --chat, --url, --deep, --computer, --discover.
   Uses pi-managed Chrome browser (port 9222).
 ---
 
@@ -63,6 +64,14 @@ node {baseDir}/scripts/perplexity-query.js "your question here"
 | `--url <URL>` | Prepend a URL for Perplexity to analyze (must be http/https) | All except conflicts |
 | `--deep` | Enable Deep Research mode (extended timeout: 10 min) | `--brief`, `--detailed`, `--chat`, `--url` |
 | `--computer` | Use Computer mode at `/computer/new` (extended timeout: 30 min) | `--detailed`, `--url` |
+| `--discover [category]` | List Discover news headlines for a category (no query needed) | `--limit` |
+| `--limit N` | Number of headlines per category for `--discover` (default: 10) | `--discover` |
+
+### Discover Categories
+
+`--discover` accepts: `top` (default), `tech`, `finance`, `arts`, `sports`, `entertainment`,
+`for-you` (alias: `you`), or `all` (scrape every category). No login query is sent; it just
+scrapes the Discover feed cards (title, url, published time, source count).
 
 ### Flag Conflicts (mutually exclusive)
 
@@ -99,6 +108,32 @@ node $SKILL_DIR/scripts/perplexity-query.js --chat "What about the security impl
 
 # Deep Research with URL
 node $SKILL_DIR/scripts/perplexity-query.js --deep --url https://arxiv.org/abs/1234.5678 "Analyze this paper"
+
+# Discover: today's top headlines
+node $SKILL_DIR/scripts/perplexity-query.js --discover top
+
+# Discover: tech headlines, top 5
+node $SKILL_DIR/scripts/perplexity-query.js --discover tech --limit 5
+
+# Discover: your personalized feed
+node $SKILL_DIR/scripts/perplexity-query.js --discover you
+
+# Discover: every category at once
+node $SKILL_DIR/scripts/perplexity-query.js --discover all --limit 10
+```
+
+## Discover Output JSON
+
+```json
+{
+  "mode": "discover",
+  "generatedAt": "2026-06-03T...",
+  "categories": {
+    "tech": [
+      { "title": "...", "url": "https://www.perplexity.ai/discover/tech/...", "sources": 14, "published": "8 hours ago" }
+    ]
+  }
+}
 ```
 
 ## Output JSON

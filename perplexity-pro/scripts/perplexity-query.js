@@ -57,12 +57,15 @@ Options:
   --computer         Use Computer mode (30 min timeout)
   --discover [cat]   List Discover news headlines (default category: top)
   --limit N          Number of discover headlines to return (default 10)
-  -h, --help         Show this help and exit`;
+  -h, --help         Show this help and exit
+  --                 End of options; everything after is treated as query text`;
 
 function parseArgs(argv) {
   const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, limit: 10, help: false };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
+    // `--` ends option parsing: everything after is query text, verbatim.
+    if (argv[i] === '--') { positional.push(...argv.slice(i + 1)); break; }
     switch (argv[i]) {
       case '-h':
       case '--help': flags.help = true; break;
@@ -102,8 +105,9 @@ function parseArgs(argv) {
         break;
       default:
         // Reject unknown flags rather than silently sending them to Perplexity.
+        // Use `--` before the query to pass dash-prefixed words as text.
         if (argv[i].startsWith('--') || /^-[a-zA-Z]/.test(argv[i])) {
-          console.error('ERROR: unknown option "' + argv[i] + '"\n\n' + HELP_TEXT);
+          console.error('ERROR: unknown option "' + argv[i] + '". To pass a dash-prefixed word as part of the query, put it after `--`.\n\n' + HELP_TEXT);
           process.exit(1);
         }
         positional.push(argv[i]);

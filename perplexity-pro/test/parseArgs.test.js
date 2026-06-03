@@ -187,3 +187,31 @@ test('parseArgs: --help sets help flag without consuming query', () => {
   const { flags } = parseArgs(['--help', 'ignored']);
   assert.equal(flags.help, true);
 });
+
+test('parseArgs: `--` ends option parsing, rest is query text', () => {
+  const { flags, query } = parseArgs(['--brief', '--', 'explain', 'the', '--verbose', 'flag']);
+  assert.equal(flags.brief, true);
+  assert.equal(query, 'explain the --verbose flag');
+});
+
+test('parseArgs: bare `--` yields empty query', () => {
+  const { query } = parseArgs(['--']);
+  assert.equal(query, '');
+});
+
+test('CLI: dash-prefixed query after `--` is accepted (exit != unknown-option)', () => {
+  // Without `--` this would be rejected as an unknown option; with it, the only
+  // reason to exit non-zero is the missing browser (Could not connect), never
+  // an "unknown option" error. This proves the severe rejection is escapable.
+  const r = runCli(['--', 'what', 'does', '--foo', 'mean']);
+  assert.doesNotMatch(r.stderr, /unknown option/);
+});
+
+test('CLI: unknown flag is rejected before any network/browser call', () => {
+  // An unknown option must fail fast with exit 1 and never attempt a connection
+  // (no "Could not connect"/retry output, no Perplexity query).
+  const r = runCli(['--nope', 'hello']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /unknown option "--nope"/);
+  assert.doesNotMatch(r.stderr, /Could not connect|Retry|Mode:/);
+});

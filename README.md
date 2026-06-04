@@ -2,7 +2,8 @@
 
 A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) skill
 for querying **Perplexity Pro** through Chrome DevTools Protocol automation — grounded AI answers
-with citations, Deep Research, URL analysis, image generation, and conversation threads.
+with citations, Deep Research, URL analysis, image generation, conversation threads,
+and search over your own thread history (Library).
 
 Compatible with pi, Claude Code, Codex CLI, Amp, and Droid.
 

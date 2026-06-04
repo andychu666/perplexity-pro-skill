@@ -56,12 +56,14 @@ Options:
   --deep             Enable Deep Research mode (10 min timeout)
   --computer         Use Computer mode (30 min timeout)
   --discover [cat]   List Discover news headlines (default category: top)
-  --limit N          Number of discover headlines to return (default 10)
+  --history "<term>" Search YOUR thread history (Library) for matching threads
+  --library "<term>" Alias for --history
+  --limit N          Max results for --discover / --history (default 10)
   -h, --help         Show this help and exit
   --                 End of options; everything after is treated as query text`;
 
 function parseArgs(argv) {
-  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, limit: 10, help: false };
+  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, history: false, limit: 10, help: false };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     // `--` ends option parsing: everything after is query text, verbatim.
@@ -74,6 +76,8 @@ function parseArgs(argv) {
       case '--chat': flags.chat = true; break;
       case '--deep': flags.deep = true; break;
       case '--computer': flags.computer = true; break;
+      case '--history':
+      case '--library': flags.history = true; break;
       case '--discover': {
         // Only consume the next token as the category if it's not another flag.
         let cat = 'top';
@@ -633,6 +637,123 @@ async function runDiscover(category, limit) {
   }
 }
 
+// ---
+// History / Library: search the signed-in user's own past threads.
+// Perplexity's Library has a "Search your threads" button that opens a filter
+// box; results render in <main> (NOT the left sidebar, which always shows the
+// 20 most-recent regardless of the filter). The search is semantic/fuzzy, so a
+// match may not contain the literal term. Row text looks like:
+//   "<type>\n<title>[\n<file chip>]\n<N> <unit> ago"   e.g. "Search\nfoo\n2mo ago"
+// ---
+const HISTORY_ROW_TYPES = ['Deep research', 'Deep Research', 'Search', 'Computer', 'Labs', 'Page', 'Task'];
+const HISTORY_AGE_RE = /\b\d+\s*(?:sec|min|m|h|hr|d|w|mo|y)\s*ago$/i;
+
+// Parse one row's innerText into { type, title, age }. Pure + exported for tests.
+function parseHistoryRowText(text) {
+  const lines = String(text).split('\n').map(s => s.trim()).filter(Boolean);
+  let type = '';
+  let age = '';
+  const body = [];
+  for (const ln of lines) {
+    if (!type && HISTORY_ROW_TYPES.includes(ln)) { type = ln; continue; }
+    if (HISTORY_AGE_RE.test(ln)) { age = ln; continue; }
+    body.push(ln);
+  }
+  // The title is the longest remaining line (file chips / labels are short).
+  const title = body.slice().sort((a, b) => b.length - a.length)[0] || '';
+  return { type, title, age };
+}
+
+// Parse the whole <main> innerText into rows. Pure + exported for tests.
+function parseHistoryRows(mainText) {
+  const lines = String(mainText).split('\n').map(s => s.trim()).filter(Boolean);
+  const groups = [];
+  let cur = null;
+  for (const ln of lines) {
+    if (HISTORY_ROW_TYPES.includes(ln)) { if (cur) groups.push(cur); cur = [ln]; }
+    else if (cur) { cur.push(ln); if (HISTORY_AGE_RE.test(ln)) { groups.push(cur); cur = null; } }
+  }
+  if (cur) groups.push(cur);
+  return groups.map(g => parseHistoryRowText(g.join('\n'))).filter(r => r.title);
+}
+
+// Read the Library <main> panel: its innerText (reliable source of result rows)
+// plus any thread anchors (best-effort URL enrichment — usually none, since rows
+// navigate via the SPA router rather than <a> tags).
+async function readLibraryMain(page) {
+  return await page.evaluate(() => {
+    const main = document.querySelector('main') || document.body;
+    const anchors = Array.from(main.querySelectorAll('a[href]'))
+      .filter(a => /\/(search|thread|page)\//.test(a.href))
+      .map(a => ({ href: a.href, text: (a.innerText || '').trim() }))
+      .filter(a => a.text.length > 0);
+    return { mainText: main.innerText || '', anchors };
+  });
+}
+
+async function runHistory(query, limit) {
+  let browser;
+  try {
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
+    const pages = await browser.pages();
+    let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
+    await page.bringToFront();
+
+    const oneLine = String(query).replace(/\s*\n+\s*/g, ' ').trim();
+
+    // Primary path: the Library honours a ?q=<term> query param and renders the
+    // filtered results directly — more robust than driving the search overlay.
+    await page.goto('https://www.perplexity.ai/library?q=' + encodeURIComponent(oneLine),
+      { waitUntil: 'networkidle2', timeout: 30000 });
+    await sleep(3500);
+
+    // Cookie consent overlay can sit on top; dismiss if present, then re-read.
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .find(x => /decline optional|got it|accept all|i agree|accept/i.test((x.innerText || '').trim()));
+      if (b) b.click();
+    });
+    await sleep(400);
+
+    let raw = await readLibraryMain(page);
+    let rows = parseHistoryRows(raw.mainText);
+
+    // Fallback: if the ?q= param rendered nothing, drive the "Search your threads"
+    // overlay manually (older UI / param ignored on direct load).
+    if (rows.length === 0) {
+      const opened = await page.evaluate(() => {
+        const b = document.querySelector('button[aria-label="Search your threads"]')
+          || Array.from(document.querySelectorAll('button, [role="button"]'))
+              .find(x => /search your threads/i.test((x.getAttribute('aria-label') || '') + ' ' + (x.innerText || '')));
+        if (b) { b.click(); return true; }
+        return false;
+      });
+      if (opened) {
+        await sleep(800);
+        await page.keyboard.type(oneLine, { delay: 35 });
+        await sleep(2600);
+        raw = await readLibraryMain(page);
+        rows = parseHistoryRows(raw.mainText);
+      }
+    }
+
+    // Best-effort URL enrichment (usually null — rows aren't <a> tags).
+    for (const r of rows) {
+      const probe = r.title.slice(0, 30);
+      const a = raw.anchors.find(x => x.text.includes(probe) || (x.text && r.title.includes(x.text.slice(0, 30))));
+      r.url = a ? a.href : null;
+    }
+
+    const ts = Date.now();
+    let screenshot = null;
+    try { screenshot = path.join(OUTPUT_DIR, 'perplexity-history-' + ts + '.png'); await page.screenshot({ path: screenshot, fullPage: false }); } catch (e) { log('Warning: could not take history screenshot: ' + e.message); }
+
+    return { mode: 'history', query: oneLine, count: Math.min(rows.length, limit), threads: rows.slice(0, limit), screenshot, url: page.url() };
+  } finally {
+    if (browser) { try { await browser.disconnect(); } catch (e) {} }
+  }
+}
+
 async function main() {
   const { flags, query } = parseArgs(process.argv.slice(2));
 
@@ -655,7 +776,21 @@ async function main() {
     }
   }
 
-  if (!query) { console.error('Usage: node perplexity-query.js [--brief|--detailed] [--chat|--deep|--computer] [--url <URL>] "your question"\n       node perplexity-query.js --discover [category|all] [--limit N]'); process.exit(1); }
+  // History mode: search the signed-in user's own past threads (Library)
+  if (flags.history) {
+    if (!query) { console.error('ERROR: --history requires a search term, e.g. --history "whisper"'); process.exit(1); }
+    log('Mode: history | Query: ' + query.substring(0, 80) + ' | Limit: ' + flags.limit);
+    try {
+      const result = await runHistory(query, flags.limit);
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    } catch (err) {
+      console.error('ERROR: history search failed: ' + err.message);
+      process.exit(1);
+    }
+  }
+
+  if (!query) { console.error('Usage: node perplexity-query.js [--brief|--detailed] [--chat|--deep|--computer] [--url <URL>] "your question"\n       node perplexity-query.js --discover [category|all] [--limit N]\n       node perplexity-query.js --history "<term>" [--limit N]'); process.exit(1); }
   validateFlags(flags);
   const finalQuery = buildQuery(query, flags);
   const timeoutMs = getTimeoutMs(flags);
@@ -690,6 +825,8 @@ module.exports = {
   getModeLabel,
   getTimeoutMs,
   safeParseTimeout,
+  parseHistoryRowText,
+  parseHistoryRows,
   DISCOVER_CATEGORIES,
   DISCOVER_ALIASES,
 };

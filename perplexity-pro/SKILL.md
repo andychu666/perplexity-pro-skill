@@ -5,8 +5,9 @@ description: >
   Use when (1) deep research with web citations needed, (2) questions where web_search
   is insufficient, (3) image generation requests, (4) complex multi-step research queries,
   (5) analyzing a specific URL, (6) continuing a conversation thread, (7) computer/tool-use tasks.
-  (8) browsing the Discover news feed by category.
-  Flags: --brief, --detailed, --chat, --url, --deep, --computer, --discover.
+  (8) browsing the Discover news feed by category, (9) searching your own past
+  threads (Library history) for prior research on a topic.
+  Flags: --brief, --detailed, --chat, --url, --deep, --computer, --discover, --history.
   Uses pi-managed Chrome browser (port 9222).
 ---
 
@@ -108,7 +109,9 @@ node {baseDir}/scripts/perplexity-query.js "your question here"
 | `--deep` | Enable Deep Research mode (extended timeout: 10 min) | `--brief`, `--detailed`, `--chat`, `--url` |
 | `--computer` | Use Computer mode at `/computer/new` (extended timeout: 30 min) | `--detailed`, `--url` |
 | `--discover [category]` | List Discover news headlines for a category (no query needed) | `--limit` |
-| `--limit N` | Number of headlines per category for `--discover` (default: 10) | `--discover` |
+| `--history "<term>"` | Search YOUR thread history (Library) for matching past threads | `--limit` |
+| `--library "<term>"` | Alias for `--history` | `--limit` |
+| `--limit N` | Max results for `--discover` / `--history` (default: 10) | `--discover`, `--history` |
 
 ### Discover Categories
 
@@ -163,6 +166,12 @@ node $SKILL_DIR/scripts/perplexity-query.js --discover you
 
 # Discover: every category at once
 node $SKILL_DIR/scripts/perplexity-query.js --discover all --limit 10
+
+# History: search your OWN past threads (Library) for prior research
+node $SKILL_DIR/scripts/perplexity-query.js --history "whisper"
+
+# History: alias + cap the number of results
+node $SKILL_DIR/scripts/perplexity-query.js --library "dashcam transcription" --limit 5
 ```
 
 ## Discover Output JSON
@@ -178,6 +187,30 @@ node $SKILL_DIR/scripts/perplexity-query.js --discover all --limit 10
   }
 }
 ```
+
+## History Output JSON
+
+```json
+{
+  "mode": "history",
+  "query": "whisper",
+  "count": 6,
+  "threads": [
+    { "type": "Search", "title": "ffmpeg filters to reduce Whisper hallucination on dashcam audio", "age": "2mo ago", "url": null }
+  ],
+  "screenshot": "/tmp/perplexity-history-1710000000000.png",
+  "url": "https://www.perplexity.ai/library?q=whisper"
+}
+```
+
+Notes:
+- The Library search is **semantic/fuzzy** — a returned thread may not contain the
+  literal search term (e.g. searching `ollama` also surfaces general local-LLM threads).
+- `type` is the thread kind (`Search`, `Deep research`, `Computer`, …); `age` is the
+  relative timestamp Perplexity shows.
+- `url` is usually `null`: Library rows navigate via the in-app router, not `<a>`
+  links, so a per-thread URL can't be scraped reliably. Use the title to locate the
+  thread, or open `url` (the filtered Library view) in a browser.
 
 ## Output JSON
 

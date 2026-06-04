@@ -159,3 +159,48 @@ bug, with no test harness in the repo.
 indexed as "symbols." Per-function `impact` (LOW) is the accurate signal here.
 - **Action:** none required — note for future reviews that doc-only churn can inflate
   the aggregate risk level.
+
+---
+
+## PR #5 — `--history` / `--library` thread-history search
+
+GitNexus-assisted review. `impact` on the new symbols (`runHistory`,
+`parseHistoryRows`, `parseHistoryRowText`, `libraryShellPresent`) is **LOW**: 0
+upstream dependents, 0 of the 6 existing execution flows affected — the feature is
+purely additive (only `parseArgs`/`main`/exports gained branches, covered by tests).
+
+### Fixed in PR #5
+
+- **[SEVERE] Silent false-negative when the Library didn't render.** `runHistory`
+  returned `count: 0` with empty `threads` whenever the Library panel failed to load
+  (expired session → login redirect, slow load). That is indistinguishable from a
+  genuine "no matches" and would wrongly imply no prior research exists — the exact
+  false-negative class that misled the very review that produced this feature. Fixed
+  by adding `libraryShellPresent()` (detects the signed-in Library chrome): the
+  manual overlay fallback now fires only when the shell is **absent** (not on a
+  genuine zero-match), and if the shell is still absent the function **throws** a
+  clear "are you signed in?" error instead of returning empty. Also removes a wasted
+  ~3.4s overlay fallback on every genuine zero-match. Covered by new
+  `libraryShellPresent` unit tests (`npm test` → 40 cases).
+
+### Deferred (filed as issues)
+
+1. **[LOW] Title equal to a row-type word can be misparsed** (#6). A thread whose
+   title is exactly `Search`/`Page`/`Computer`/… is treated as a row delimiter by
+   `parseHistoryRows`. Low probability; harden by requiring an `… ago` line to close
+   the group, or anchor on row container structure.
+2. **[LOW] Age regex misses `just now` / localized timestamps** (#7).
+   `HISTORY_AGE_RE` only matches `<N><unit> ago`; other forms could leak in as a
+   title candidate. Add `just now|now` and locale forms (cf. the Chinese fallbacks in
+   `toggleDeepResearch`).
+3. **[LOW] Reuses/navigates an existing Perplexity tab** (#8). `runHistory` navigates
+   the first `perplexity.ai` tab to `library?q=...`, interrupting an open thread.
+   Shared with `--discover`/standard query, so a pattern-wide concern rather than new.
+
+### Known limitation (documented, not a bug)
+
+- `threads[].url` is usually `null`: Library result rows navigate via the in-app
+  router, not `<a>` tags, so per-thread URLs can't be scraped reliably. The
+  top-level `url` returns the filtered Library view (`library?q=<term>`). Library
+  search is also **semantic/fuzzy** — a hit need not contain the literal term. Both
+  are noted in `SKILL.md`.

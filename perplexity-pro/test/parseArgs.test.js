@@ -16,7 +16,8 @@ const { execFileSync } = require('node:child_process');
 const path = require('node:path');
 
 const SCRIPT = path.join(__dirname, '..', 'scripts', 'perplexity-query.js');
-const { parseArgs, buildQuery, getModeLabel, safeParseTimeout, DISCOVER_ALIASES } = require(SCRIPT);
+const { parseArgs, buildQuery, getModeLabel, safeParseTimeout, DISCOVER_ALIASES,
+        parseHistoryRowText, parseHistoryRows, libraryShellPresent } = require(SCRIPT);
 
 // Run the CLI in a subprocess; return { code, stdout, stderr }.
 function runCli(args) {
@@ -122,7 +123,70 @@ test('DISCOVER_ALIASES maps friendly names', () => {
   assert.equal(DISCOVER_ALIASES.you, 'for-you');
 });
 
+// --- History / Library thread search ---
+test('parseArgs: --history sets flag, query is the search term', () => {
+  const { flags, query } = parseArgs(['--history', 'whisper', 'cpp']);
+  assert.equal(flags.history, true);
+  assert.equal(query, 'whisper cpp');
+});
+
+test('parseArgs: --library is an alias for --history', () => {
+  assert.equal(parseArgs(['--library', 'ffmpeg']).flags.history, true);
+});
+
+test('parseArgs: --history honours --limit', () => {
+  const { flags } = parseArgs(['--history', 'vad', '--limit', '5']);
+  assert.equal(flags.history, true);
+  assert.equal(flags.limit, 5);
+});
+
+test('parseHistoryRowText: type + title + age', () => {
+  const r = parseHistoryRowText('Search\nffmpeg filters to reduce Whisper hallucination\n2mo ago');
+  assert.equal(r.type, 'Search');
+  assert.equal(r.title, 'ffmpeg filters to reduce Whisper hallucination');
+  assert.equal(r.age, '2mo ago');
+});
+
+test('parseHistoryRowText: ignores short file-chip lines, keeps longest as title', () => {
+  const r = parseHistoryRowText('Deep research\nhow is gemma4 audio to text vs whisper.cpp\nnote.md\n1mo ago');
+  assert.equal(r.type, 'Deep research');
+  assert.equal(r.title, 'how is gemma4 audio to text vs whisper.cpp');
+});
+
+test('parseHistoryRows: splits a multi-row main panel on type markers', () => {
+  const main = [
+    'History', 'Type', 'Sort: Newest',
+    'Search', 'first thread title here', '3d ago',
+    'Deep research', 'second longer thread title', '1mo ago',
+  ].join('\n');
+  const rows = parseHistoryRows(main);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].title, 'first thread title here');
+  assert.equal(rows[1].type, 'Deep research');
+  assert.equal(rows[1].age, '1mo ago');
+});
+
+test('parseHistoryRows: empty input yields no rows', () => {
+  assert.deepEqual(parseHistoryRows(''), []);
+});
+
+test('libraryShellPresent: true when Library chrome is rendered', () => {
+  assert.equal(libraryShellPresent('History\nNew Thread\nType\nTemporary Threads: Show\nSort: Newest'), true);
+  assert.equal(libraryShellPresent('Sort: Newest\nSearch\nfoo\n2mo ago'), true);
+});
+
+test('libraryShellPresent: false for a logged-out / non-Library page', () => {
+  // The signed-out page has none of the Library controls.
+  assert.equal(libraryShellPresent('Sign in to continue\nContinue with Google'), false);
+  assert.equal(libraryShellPresent(''), false);
+});
+
 // --- Validation errors that call process.exit(1) (run via subprocess) ---
+test('CLI: --history with no term exits 1', () => {
+  const r = runCli(['--history']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /--history requires a search term/);
+});
 test('CLI: --limit with missing value exits 1', () => {
   const r = runCli(['--discover', 'tech', '--limit']);
   assert.equal(r.code, 1);

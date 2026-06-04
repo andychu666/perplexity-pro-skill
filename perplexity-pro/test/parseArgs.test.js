@@ -17,7 +17,7 @@ const path = require('node:path');
 
 const SCRIPT = path.join(__dirname, '..', 'scripts', 'perplexity-query.js');
 const { parseArgs, buildQuery, getModeLabel, safeParseTimeout, DISCOVER_ALIASES,
-        parseHistoryRowText, parseHistoryRows } = require(SCRIPT);
+        parseHistoryRowText, parseHistoryRows, libraryShellPresent } = require(SCRIPT);
 
 // Run the CLI in a subprocess; return { code, stdout, stderr }.
 function runCli(args) {
@@ -168,6 +168,17 @@ test('parseHistoryRows: splits a multi-row main panel on type markers', () => {
 
 test('parseHistoryRows: empty input yields no rows', () => {
   assert.deepEqual(parseHistoryRows(''), []);
+});
+
+test('libraryShellPresent: true when Library chrome is rendered', () => {
+  assert.equal(libraryShellPresent('History\nNew Thread\nType\nTemporary Threads: Show\nSort: Newest'), true);
+  assert.equal(libraryShellPresent('Sort: Newest\nSearch\nfoo\n2mo ago'), true);
+});
+
+test('libraryShellPresent: false for a logged-out / non-Library page', () => {
+  // The signed-out page has none of the Library controls.
+  assert.equal(libraryShellPresent('Sign in to continue\nContinue with Google'), false);
+  assert.equal(libraryShellPresent(''), false);
 });
 
 // --- Validation errors that call process.exit(1) (run via subprocess) ---

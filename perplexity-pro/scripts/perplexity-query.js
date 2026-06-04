@@ -677,6 +677,15 @@ function parseHistoryRows(mainText) {
   return groups.map(g => parseHistoryRowText(g.join('\n'))).filter(r => r.title);
 }
 
+// Heuristic: did the signed-in Library shell actually render? These controls
+// appear regardless of how many threads match; a logged-out/redirected page does
+// not have them. Lets us tell "0 genuine matches" apart from "Library never
+// loaded" (e.g. session expired) so the latter can't masquerade as 0 results.
+// Pure + exported for tests.
+function libraryShellPresent(mainText) {
+  return /temporary threads|sort:\s|new thread/i.test(String(mainText));
+}
+
 // Read the Library <main> panel: its innerText (reliable source of result rows)
 // plus any thread anchors (best-effort URL enrichment — usually none, since rows
 // navigate via the SPA router rather than <a> tags).
@@ -716,11 +725,13 @@ async function runHistory(query, limit) {
     await sleep(400);
 
     let raw = await readLibraryMain(page);
-    let rows = parseHistoryRows(raw.mainText);
+    let shell = libraryShellPresent(raw.mainText);
+    let rows = shell ? parseHistoryRows(raw.mainText) : [];
 
-    // Fallback: if the ?q= param rendered nothing, drive the "Search your threads"
-    // overlay manually (older UI / param ignored on direct load).
-    if (rows.length === 0) {
+    // Fallback ONLY when the Library shell didn't render (param ignored / older
+    // UI) — NOT when it rendered with zero genuine matches. Drive the "Search
+    // your threads" overlay manually.
+    if (!shell) {
       const opened = await page.evaluate(() => {
         const b = document.querySelector('button[aria-label="Search your threads"]')
           || Array.from(document.querySelectorAll('button, [role="button"]'))
@@ -733,8 +744,17 @@ async function runHistory(query, limit) {
         await page.keyboard.type(oneLine, { delay: 35 });
         await sleep(2600);
         raw = await readLibraryMain(page);
-        rows = parseHistoryRows(raw.mainText);
+        shell = libraryShellPresent(raw.mainText);
+        rows = shell ? parseHistoryRows(raw.mainText) : [];
       }
+    }
+
+    // Distinguish "no matches" (shell present, 0 rows) from "Library didn't load"
+    // (signed out / redirected to login). The latter must surface as an error,
+    // never as a misleading empty result.
+    if (!shell) {
+      throw new Error('Perplexity Library did not render — check you are signed in at perplexity.ai '
+        + '(no History / "Search your threads" UI found). Current URL: ' + page.url());
     }
 
     // Best-effort URL enrichment (usually null — rows aren't <a> tags).
@@ -827,6 +847,7 @@ module.exports = {
   safeParseTimeout,
   parseHistoryRowText,
   parseHistoryRows,
+  libraryShellPresent,
   DISCOVER_CATEGORIES,
   DISCOVER_ALIASES,
 };

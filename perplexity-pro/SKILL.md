@@ -17,7 +17,7 @@ Query Perplexity Pro via Chrome CDP browser automation using pi's Chrome instanc
 ## Prerequisites
 
 - Chrome running with remote debugging on `:9222`
-- Logged into Perplexity Pro account in Chrome
+- Logged into Perplexity Pro account in Chrome (see [Login](#login-do-this-once-before-your-first-query))
 - `puppeteer-core` available
 
 ## Setup
@@ -56,6 +56,40 @@ google-chrome-stable \
 # Or with a visible display for login
 # Omit --headless if you have X11/DISPLAY setup
 ```
+
+## Login (do this once, before your first query)
+
+Perplexity Pro answers require a logged-in session. **The login lives in the Chrome
+profile on disk** (`~/.cache/browser-tools`), not in the running process — so you
+log in once in a *visible* window and every later *headless* run reuses that
+session automatically.
+
+> ⚠️ One profile can only be opened by one Chrome at a time (a `SingletonLock` in
+> the profile dir enforces this). Stop any headless Chrome on `:9222` before
+> launching a visible one on the same `--user-data-dir`.
+
+1. Stop any headless instance using the profile:
+   ```bash
+   pkill -f 'remote-debugging-port=9222'
+   ```
+2. Launch a **visible** Chrome on the same profile (needs a desktop / X display —
+   note the **omitted** `--headless`):
+   ```bash
+   google-chrome-stable --remote-debugging-port=9222 \
+     --user-data-dir=~/.cache/browser-tools \
+     --no-first-run --no-default-browser-check
+   ```
+3. In that window go to <https://www.perplexity.ai>, sign in (Google SSO / email /
+   magic link — whatever your Pro account uses), and confirm your account shows as
+   logged in.
+4. Close the window, then relaunch **headless** (the Quick Start command above).
+   The session persists on disk; queries now run authenticated.
+
+You only repeat this when the session eventually expires — symptom: logged-out or
+Pro-gated answers (see the *Not logged in* item under [Troubleshooting](#troubleshooting)).
+Don't try to log in *through* headless automation: Google SSO / magic-link flows
+fight bot input (captcha, device checks). The visible-login → headless-reuse
+pattern sidesteps all of it.
 
 ## Quick Query
 
@@ -182,6 +216,37 @@ This is a port of an earlier Perplexity Pro skill (built for OpenClaw) to the pi
 - No OpenClaw dependency
 - Headless-friendly: Chrome started with `--headless` works (log into Perplexity at least once interactively first)
 - Deep Research toggle rewritten for Perplexity's current Radix dropdown UI
+
+## Prompting guide
+
+**The query string is a research question, not a command.** Whatever you pass
+becomes what Perplexity researches on the web, so be specific, state constraints,
+and name the deliverable you want back:
+
+- Good: `"Compare Postgres vs MySQL for write-heavy time-series workloads in 2026 — cover partitioning, compression, and ingestion throughput; give a table with tradeoffs"`
+- Weak: `"postgres vs mysql"`
+
+- Put the *output shape* in the prompt ("give a table", "list with tradeoffs", "cite sources for each claim").
+- `--brief` for a single fact; `--detailed` / `--deep` when you want multi-source synthesis with citations.
+- `--url <page>` grounds the answer in a specific source instead of the open web.
+- Consume the JSON `answer` + `sources` fields programmatically — don't rely on the screenshot.
+
+### Asking about Perplexity's *own* UI (Discover, library, threads) — scrape it, don't query it
+
+Perplexity **cannot see its own Discover feed**. A text query like *"what's on
+Perplexity Discover today?"* returns a generic web answer, not the real cards. To
+get the actual feed you must read the **DOM** — use `--discover` (which does exactly
+that), or drive the browser directly. Canonical agent prompt for a news digest:
+
+> Use the browser tools to open https://www.perplexity.ai/discover, click the Top
+> tab, and scrape the real story cards (headline + URL from the DOM — don't ask
+> Perplexity as a text query, it can't see its own feed). Then write
+> ~/Downloads/discover-news.md with each story as: ## Headline, a one-line summary,
+> and a clickable link to its Perplexity URL.
+
+The same rule applies to anything that is *UI state* rather than a researchable
+question (your library, saved threads, account settings): **scrape the DOM, don't
+ask Perplexity about itself.**
 
 ## Usage Guidelines
 

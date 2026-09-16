@@ -15,6 +15,7 @@ const path = require('path');
 // have to reinstall if they already have it.
 function loadPuppeteer() {
   const candidates = [
+    path.join(process.env.HOME || '', 'node_modules', 'puppeteer-core'),
     'puppeteer-core',
     path.join(__dirname, '..', 'node_modules', 'puppeteer-core'),
     process.env.PUPPETEER_CORE_PATH,
@@ -202,6 +203,41 @@ async function findFollowUpInput(page) {
     for (let i = els.length - 1; i >= 0; i--) { const visible = await els[i].evaluate(e => e.offsetHeight > 0); if (visible) return els[i]; }
   }
   return null;
+}
+
+async function waitForFollowUpInput(page, timeoutMs = 20000) {
+  // The thread view renders its composer after hydration, and Chrome may have
+  // discarded a background tab (URL kept, DOM gone) — so poll, and reload once if
+  // the page reports no composer at all despite being "complete".
+  const deadline = Date.now() + timeoutMs;
+  let attempt = 0;
+  let reloaded = false;
+  for (;;) {
+    attempt++;
+    const input = await findFollowUpInput(page);
+    if (input) return input;
+
+    const probe = await page.evaluate(() => ({
+      ce: document.querySelectorAll('[contenteditable="true"]').length,
+      ta: document.querySelectorAll('textarea').length,
+      ready: document.readyState,
+      bodyChildren: document.body ? document.body.childElementCount : -1,
+    })).catch(() => null);
+
+    if (process.env.PPLX_DEBUG_INPUT) log(`input probe #${attempt}: ${JSON.stringify(probe)}`);
+
+    if (!reloaded && probe && probe.ready === 'complete'
+        && probe.ce === 0 && probe.ta === 0 && attempt >= 2) {
+      reloaded = true;
+      log('No composer found and the page looks discarded; reloading once');
+      try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e) { log('Warning: reload failed: ' + e.message); }
+      await sleep(2500);
+      continue;
+    }
+
+    if (Date.now() > deadline) return null;
+    await sleep(1000);
+  }
 }
 
 async function dismissModals(page) {
@@ -548,14 +584,15 @@ async function runQuery(flags, query, timeoutMs) {
         if (!perplexityPage) {
           perplexityPage = await browser.newPage();
           await perplexityPage.goto(flags.thread, { waitUntil: 'domcontentloaded' });
-          await sleep(3000);
+          await sleep(2000);
         }
+        await perplexityPage.bringToFront();
       } else {
         for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
       }
       if (!perplexityPage) throw new Error('--chat requires an existing Perplexity search thread. No tab found with a /search/ or /thread/ URL.');
       await perplexityPage.bringToFront();
-      const input = await findFollowUpInput(perplexityPage);
+      const input = await waitForFollowUpInput(perplexityPage);
       if (!input) throw new Error('Could not find follow-up input in existing thread');
       // Snapshot the block count before submitting so extraction can ignore the
       // earlier turns already mounted in this thread.
@@ -564,12 +601,29 @@ async function runQuery(flags, query, timeoutMs) {
       await sleep(500);
       await perplexityPage.keyboard.press('Enter');
       const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags, blocksBefore);
+
+      // Prefer reading the answer back from the thread itself: the thread JSON
+      // carries the finished answer, so the result no longer depends on DOM
+      // extraction at all (only the submission still touches the UI).
+      let finalAnswer = answer;
+      if (!isImageGen) {
+        try {
+          const session = require('./session.js');
+          const read = await session.latestAnswer(perplexityPage.url());
+          if (read.answer && read.answer.trim()) {
+            finalAnswer = read.answer;
+            log(`chat: read answer back from the session (${read.answer.length} chars, ${read.entries} entries)`);
+          }
+        } catch (e) {
+          log('Warning: session read-back failed (' + e.message + '); using the DOM answer');
+        }
+      }
       let generatedImages = [];
       if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
       const ts = Date.now();
       let screenshotPath = null;
       try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
-      return { query, answer: answer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
+      return { query, answer: finalAnswer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
     }
 
     const pages = await browser.pages();
@@ -760,6 +814,26 @@ async function readLibraryMain(page) {
 }
 
 async function runHistory(query, limit) {
+  const oneLineQuery = String(query).replace(/\s*\n+\s*/g, ' ').trim();
+
+  // Session path first: the Library list endpoint answers directly, with none of
+  // the shell-rendering/overlay fragility of scraping the Library UI.
+  try {
+    const session = require('./session.js');
+    const hits = await session.searchHistory(oneLineQuery, { limit });
+    log(`history: session search matched ${hits.length} thread(s)`);
+    return {
+      mode: 'history',
+      query: oneLineQuery,
+      count: hits.length,
+      threads: hits,
+      screenshot: null,
+      url: 'https://www.perplexity.ai/library',
+    };
+  } catch (e) {
+    log('Warning: session history search failed (' + e.message + '); falling back to the Library UI');
+  }
+
   let browser;
   try {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });

@@ -158,12 +158,17 @@ async function internalFetch(pathname, cookies, init = {}) {
 async function readCapped(res, maxBytes) {
   const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
   if (!reader) {
-    // Still enforce the cap: an uncapped fallback would defeat the guard.
-    const text = await res.text();
-    if (Buffer.byteLength(text) > maxBytes) {
+    // Still enforce the cap: check the declared length before buffering, then
+    // verify what was actually read.
+    const declared = Number(res.headers && typeof res.headers.get === 'function' ? res.headers.get('content-length') : NaN);
+    if (Number.isFinite(declared) && declared > maxBytes) {
       throw new Error(`response exceeded ${Math.round(maxBytes / 1048576)} MiB`);
     }
-    return text;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) {
+      throw new Error(`response exceeded ${Math.round(maxBytes / 1048576)} MiB`);
+    }
+    return buf.toString('utf8');
   }
   const chunks = [];
   let total = 0;
@@ -206,7 +211,13 @@ function toInt(value, fallback) {
 }
 
 function threadSlug(value) {
+  // String(null) is "null" and String(undefined) is "undefined": both would pass
+  // the slug regex and request /rest/thread/null.
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    throw new Error(`invalid thread reference: ${String(value).slice(0, 80)}`);
+  }
   const raw = String(value).trim();
+  if (!raw) throw new Error('invalid thread reference: empty');
   // Match the slug at a path boundary AND at the end of the value, so
   // "search/abc/def" is rejected instead of silently truncating to "abc".
   const m = raw.match(/(?:^|\/)(?:search|thread)\/([A-Za-z0-9_-]+)\/?(?:[?#].*)?$/);

@@ -244,7 +244,8 @@ if (opts.history) {
     process.exit(1);
   }
   const results = Array.isArray(hits) ? hits : [];
-  if (results.truncated) {
+  // Read the flag off the original value: after coercion to an array it is gone.
+  if (hits && hits.truncated) {
     console.error('Warning: history scan stopped early; results may be incomplete');
   }
   if (opts.json) {

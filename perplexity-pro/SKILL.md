@@ -291,6 +291,25 @@ ask Perplexity about itself.**
 - Use `--chat` to follow up on a previous query in the same thread
 - Use `--url` to ask Perplexity to analyze a specific webpage
 
+## Deep research via the Agent API (preferred when a key is set)
+
+`--deep` through the browser is fragile (the mode lives in the composer's `/`
+menu and must be picked on an empty composer). When `PERPLEXITY_API_KEY` is
+available, prefer the Agent API instead:
+
+```bash
+node scripts/perplexity-research.mjs --query "..." --preset medium
+node scripts/perplexity-research.mjs --resume <job_id>     # collect a background job
+```
+
+- presets: `fast` (seconds) · `low` · `medium` (default) · `high` · `xhigh`
+- `high`/`xhigh` run as background jobs, polled with backoff; if the run times out
+  the server-side job continues and `--resume <job_id>` collects it
+- **save-and-preview**: the full report goes to `<output-dir>/*.md` + `*.json`;
+  stdout carries only a preview (`--stdout-preview`, default 1500 chars) and the
+  saved paths, so a long report does not flood the agent's context
+- the run prints the API cost it incurred; keep `high`/`xhigh` for real research
+
 ## API fallback (search-api.mjs)
 
 When the browser is unavailable, `scripts/search-api.mjs` queries the official

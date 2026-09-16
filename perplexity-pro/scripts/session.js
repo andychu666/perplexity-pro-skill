@@ -194,13 +194,26 @@ async function readCapped(res, maxBytes) {
 function failureReason(res, what) {
   // Slice before normalising: res.text can be megabytes on a runaway error page.
   const snippet = String(res.text || '').slice(0, 512).replace(/\s+/g, ' ').slice(0, 160);
+  let err;
   if (res.status >= 300 && res.status < 400) {
-    return new Error(`${what} redirected (HTTP ${res.status}) - the Perplexity session looks expired; re-login in the OpenClaw browser`);
+    err = new Error(`${what} redirected (HTTP ${res.status}) - the Perplexity session looks expired; re-login in the OpenClaw browser`);
+  } else if (res.status === 401 || res.status === 403) {
+    err = new Error(`${what} refused (HTTP ${res.status}) - session may have expired or lack permission${snippet ? `: ${snippet}` : ''}`);
+  } else {
+    err = new Error(`${what} returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
   }
-  if (res.status === 401 || res.status === 403) {
-    return new Error(`${what} refused (HTTP ${res.status}) - session may have expired or lack permission${snippet ? `: ${snippet}` : ''}`);
+  // Structured status so callers classify on the code, not on message wording.
+  err.status = res.status;
+  return err;
+}
+
+/** True when a failure means the session is gone (auth/redirect) rather than a
+ *  transient hiccup. Prefers the structured status; the message is a fallback. */
+function isAuthFailure(e) {
+  if (e && typeof e.status === 'number') {
+    return e.status === 401 || e.status === 403 || (e.status >= 300 && e.status < 400);
   }
-  return new Error(`${what} returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+  return /401|403|redirect|expired|refused/i.test(String((e && e.message) || ''));
 }
 
 /** Coerce a caller-supplied number to a sane non-negative integer so it can be
@@ -296,7 +309,7 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       // A transient failure mid-scan can keep the partial hits, but an expired
       // session (or any auth/redirect failure) must surface, not look like
       // "no more results".
-      if (page === 0 || /401|403|redirect|expired|refused/i.test(e.message)) throw e;
+      if (page === 0 || isAuthFailure(e)) throw e;
       truncated = true; // partial: the caller must be able to tell
       break;
     }
@@ -319,11 +332,9 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
     if (hitCap) truncated = true;
     if (hitCap || hits.length >= safeLimit) break;
   }
-  const out = hits.slice(0, safeLimit);
-  // Enumerable so it survives inspection; note that JSON.stringify of an array
-  // drops non-index properties, so the CLI also warns on stderr.
-  if (truncated) Object.defineProperty(out, 'truncated', { value: true, enumerable: true });
-  return out;
+  // An object, not a decorated array: JSON.stringify drops non-index array
+  // properties, so the truncation flag would vanish for API consumers.
+  return { hits: hits.slice(0, safeLimit), truncated };
 }
 async function getThread(slugOrUrl, { cookies } = {}) {
   const jar = cookies || await getCookies();
@@ -474,7 +485,7 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     } catch (e) {
       // An empty read is fine, but an expired session must not be reported as
       // "empty answer".
-      if (/401|403|redirect|expired|refused/i.test(e.message)) throw e;
+      if (isAuthFailure(e)) throw e;
     }
   }
   return { answer, slug: answerSlug, cookies: jar };

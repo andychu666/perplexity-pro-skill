@@ -110,6 +110,13 @@ if (!Array.isArray(cookies) || cookies.length === 0) {
 }
 
 const REDACT = Symbol('redact');
+// The session helper returns the live cookie jar alongside its payload (the
+// caller chains it into the next request). It must never reach stdout or logs.
+function withoutCookies(value) {
+  if (!value || typeof value !== 'object') return value;
+  const { cookies, ...rest } = value;
+  return rest;
+}
 // Deep redaction: nested objects/arrays and numeric identifiers leak the same
 // account data as top-level strings.
 function redactValue(value) {
@@ -203,7 +210,7 @@ if (opts.models) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(info, null, 2));
+    console.log(JSON.stringify(withoutCookies(info), null, 2));
   } else {
     const models = Array.isArray(info.models) ? info.models : [];
     console.log(`models: ${models.length}`);
@@ -223,7 +230,7 @@ if (opts.discover) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(feed, null, 2));
+    console.log(JSON.stringify(withoutCookies(feed), null, 2));
   } else {
     const items = Array.isArray(feed.items) ? feed.items : [];
     console.log(`discover: ${items.length} item(s)`);
@@ -236,16 +243,17 @@ if (opts.discover) {
 }
 
 if (opts.history) {
-  let hits;
+  let result;
   try {
-    hits = await session.searchHistory(opts.history, { limit: opts.limit, cookies });
+    result = await session.searchHistory(opts.history, { limit: opts.limit, cookies });
   } catch (e) {
     console.error(`Error: history search failed (${e.message})`);
     process.exit(1);
   }
-  const results = Array.isArray(hits) ? hits : [];
-  // Read the flag off the original value: after coercion to an array it is gone.
-  if (hits && hits.truncated) {
+  // searchHistory returns {hits, truncated}; tolerate a bare array too.
+  const results = Array.isArray(result) ? result
+    : (result && Array.isArray(result.hits) ? result.hits : []);
+  if (result && result.truncated) {
     console.error('Warning: history scan stopped early; results may be incomplete');
   }
   if (opts.json) {

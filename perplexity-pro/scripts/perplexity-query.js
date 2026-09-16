@@ -82,7 +82,11 @@ function parseArgs(argv) {
         const threadUrl = argv[++i];
         try {
           const parsed = new URL(threadUrl);
-          if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.endsWith('perplexity.ai')) {
+          // Exact host match: endsWith('perplexity.ai') accepts evilperplexity.ai,
+          // which would navigate the *signed-in* CDP browser to an attacker origin.
+          const host = parsed.hostname.toLowerCase();
+          const okHost = host === 'perplexity.ai' || host.endsWith('.perplexity.ai');
+          if (!['http:', 'https:'].includes(parsed.protocol) || !okHost) {
             console.error('ERROR: --thread must be a perplexity.ai http(s) URL');
             process.exit(1);
           }
@@ -381,17 +385,28 @@ async function waitAndDownloadImages(page, timeoutMs) {
   if (safeImages.length < imageUrls.length) log('Warning: filtered out ' + (imageUrls.length - safeImages.length) + ' non-https image URLs');
 
   const downloaded = [];
-  const ts = Date.now();
+  // Same-millisecond runs used to overwrite each other's artifacts.
+  const uid = () => `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   for (let i = 0; i < safeImages.length; i++) {
     try {
       const dataUrl = await page.evaluate(async (url) => {
-        const res = await fetch(url);
-        const blob = await res.blob();
-        return new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); });
+        // Per-image bounds: without them one stalled request hangs the run and
+        // one huge (or non-image) response lands in memory as a data URL.
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 15000);
+        try {
+          const res = await fetch(url, { signal: ctrl.signal });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const type = res.headers.get('content-type') || '';
+          if (!type.startsWith('image/')) throw new Error('not an image (' + type + ')');
+          const blob = await res.blob();
+          if (blob.size > 8 * 1048576) throw new Error('image too large: ' + blob.size + ' bytes');
+          return await new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(blob); });
+        } finally { clearTimeout(t); }
       }, safeImages[i].src);
       const base64 = dataUrl.split(',')[1];
       const ext = dataUrl.startsWith('data:image/png') ? 'png' : dataUrl.startsWith('data:image/webp') ? 'webp' : 'jpg';
-      const filepath = path.join(OUTPUT_DIR, 'perplexity-gen-' + ts + '-' + i + '.' + ext);
+      const filepath = path.join(OUTPUT_DIR, 'perplexity-gen-' + uid() + '-' + i + '.' + ext);
       fs.writeFileSync(filepath, Buffer.from(base64, 'base64'));
       downloaded.push({ path: filepath, alt: safeImages[i].alt, width: safeImages[i].width, height: safeImages[i].height });
     } catch (e) { log('Warning: failed to download image ' + i + ': ' + e.message); }
@@ -421,10 +436,22 @@ async function typeQuery(page, input, query) {
     }, oneLine);
   }
   await sleep(200);
-  const got = await input.evaluate(el => (el.value !== undefined ? el.value : el.innerText) || '');
-  if (got.trim().length < Math.min(oneLine.length, 10)) {
-    log('Warning: input verification short (got ' + got.length + '/' + oneLine.length + ' chars), retrying type');
+  // Verify the WHOLE query landed: the old check only required min(len, 10)
+  // characters, so a truncated composer submitted a different question and
+  // still looked fine.
+  const readBack = async () => String(
+    await input.evaluate(el => (el.value !== undefined ? el.value : el.innerText) || '')
+  ).replace(/\s+/g, ' ').trim();
+  const want = oneLine.replace(/\s+/g, ' ').trim();
+  let got = await readBack();
+  if (got !== want) {
+    log('Warning: input verification short (got ' + got.length + '/' + want.length + ' chars), retrying type');
     await input.type(oneLine, { delay: 10 });
+    await sleep(300);
+    got = await readBack();
+  }
+  if (got !== want) {
+    throw new Error('Could not type the full query (composer holds ' + got.length + '/' + want.length + ' chars)');
   }
 }
 
@@ -571,8 +598,11 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
 
 async function runQuery(flags, query, timeoutMs) {
   let browser;
+  let openedPage = null;
   try {
-    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
+    // protocolTimeout: without it a wedged CDP socket makes every page call hang
+    // forever instead of failing.
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null, protocolTimeout: 60000 });
 
     if (flags.chat) {
       // Preferred path: submit the follow-up through the session layer. No
@@ -604,7 +634,8 @@ async function runQuery(flags, query, timeoutMs) {
         perplexityPage = pages.find((p) => p.url().startsWith(flags.thread)) || null;
         if (!perplexityPage) {
           perplexityPage = await browser.newPage();
-          await perplexityPage.goto(flags.thread, { waitUntil: 'domcontentloaded' });
+          openedPage = perplexityPage;
+          await perplexityPage.goto(flags.thread, { waitUntil: 'domcontentloaded', timeout: 30000 });
           await sleep(2000);
         }
         await perplexityPage.bringToFront();
@@ -649,7 +680,7 @@ async function runQuery(flags, query, timeoutMs) {
 
     const pages = await browser.pages();
     let perplexityPage = pages.find(p => { const url = p.url(); return url.includes('perplexity.ai') && !url.includes('count.perplexity') && !url.includes('service-worker') && !url.startsWith('blob:'); });
-    if (!perplexityPage) perplexityPage = await browser.newPage();
+    if (!perplexityPage) { perplexityPage = await browser.newPage(); openedPage = perplexityPage; }
     await perplexityPage.bringToFront();
 
     if (flags.computer) {
@@ -694,12 +725,15 @@ async function runQuery(flags, query, timeoutMs) {
     let sources = [];
     try { sources = await perplexityPage.evaluate(() => { const links = document.querySelectorAll('[class*="source"] a, [class*="citation"] a'); return Array.from(links).slice(0, 10).map(a => ({ title: a.textContent ? a.textContent.trim() : '', url: a.href })).filter(s => s.url && !s.url.includes('perplexity.ai')); }); } catch (e) { log('Warning: source extraction failed: ' + e.message); }
 
-    const ts = Date.now();
+    const ts = Date.now() + '-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
     let screenshotPath = null;
     try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
 
     return { query, answer: answer || (isImageGen ? '[Image generated - see generatedImages]' : '[No answer received]'), mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url() };
   } finally {
+    // Tabs we opened are ours to close: the old code only disconnected, so
+    // every run leaked a tab (and its memory) into the long-lived browser.
+    if (openedPage) { try { await openedPage.close(); } catch (e) {} }
     if (browser) { try { await browser.disconnect(); } catch (e) {} }
   }
 }
@@ -985,6 +1019,9 @@ async function main() {
       lastError = err;
       log('Attempt ' + (attempt + 1) + ' failed: ' + err.message);
       if (err.message.includes('--chat requires') || err.message.includes('Could not find follow-up') || err.message.includes('Could not connect') || err.message.includes('connect ECONNREFUSED')) break;
+      // A chat follow-up is not idempotent: retrying posts the same question into
+      // the thread again and pollutes it.
+      if (flags.chat) break;
     }
   }
   console.error('ERROR: All attempts failed. Last error: ' + (lastError ? lastError.message : 'unknown'));

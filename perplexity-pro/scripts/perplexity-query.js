@@ -400,6 +400,9 @@ async function countProseBlocks(page) {
       document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
     );
   } catch (e) {
+    // Returning 0 silently re-enables the merge-all-previous-turns behaviour this
+    // scoping exists to prevent, so make the degradation visible.
+    log('Warning: could not snapshot prose blocks (' + e.message + '); chat extraction may include earlier turns');
     return 0;
   }
 }
@@ -498,8 +501,10 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
     return { text: await extractText(blocksBefore), isImageGen };
   }
 
-  const STABLE_WITH_HINT = 2;   // stable polls needed when UI confirms not-generating
-  const STABLE_NO_HINT = 5;     // stable polls needed without that confirmation
+  // Chat follow-ups stream like Deep Research, so they need a longer quiet window
+  // than a one-shot answer (review finding: chat was accepted while still partial).
+  const STABLE_WITH_HINT = flags.chat ? 4 : 2;   // stable polls needed when UI confirms not-generating
+  const STABLE_NO_HINT = flags.chat ? 7 : 5;     // stable polls needed without that confirmation
   const POLL_MS = 1500;
   let prev = '';
   let stableCount = 0;

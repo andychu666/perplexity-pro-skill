@@ -33,6 +33,13 @@ if (queries.length === 0) {
   process.exit(1);
 }
 
+// Drop blank/whitespace-only queries: they would burn quota and usually 422.
+const cleanQueries = queries.map((q) => q.trim()).filter((q) => q.length > 0);
+if (cleanQueries.length === 0) {
+  console.error("Error: no non-empty query given");
+  process.exit(2);
+}
+
 const apiKey = process.env.PERPLEXITY_API_KEY;
 if (!apiKey) {
   console.error("Error: PERPLEXITY_API_KEY environment variable not set");
@@ -59,7 +66,8 @@ async function searchOne(query) {
     });
 
     if (!response.ok) {
-      const error = await response.text();
+      // Truncate: an HTML error page would otherwise dump kilobytes to stderr.
+      const error = (await response.text()).slice(0, 300);
       throw new Error(`Perplexity API error (${response.status}): ${error}`);
     }
 
@@ -87,7 +95,10 @@ function itemsOf(result) {
 
 function formatItems(items, query) {
   const lines = [];
-  if (query) lines.push(`## ${query}\n`);
+  if (query) {
+    // Single line only: a newline (or "##") in a query would break the header.
+    lines.push(`## ${String(query).replace(/\s+/g, ' ').slice(0, 120)}\n`);
+  }
   if (!items || items.length === 0) {
     lines.push("_No results._\n");
     return lines.join("\n");
@@ -95,7 +106,8 @@ function formatItems(items, query) {
   for (const item of items.slice(0, MAX_RESULTS)) {
     if (item.title) lines.push(`**${item.title}**`);
     if (item.url) lines.push(item.url);
-    if (item.snippet) {
+    // Type guard: a non-string snippet would throw on .split().
+    if (typeof item.snippet === "string" && item.snippet) {
       const firstLine = item.snippet.split("\n")[0];
       const clean = firstLine.slice(0, SNIPPET_CHARS);
       lines.push(clean + (firstLine.length > SNIPPET_CHARS ? "..." : ""));
@@ -109,7 +121,7 @@ try {
   // One request per query: each result keeps its own label, and a batch never
   // gets attributed to queries[0].
   const collected = [];
-  for (const query of queries) {
+  for (const query of cleanQueries) {
     collected.push({ query, result: await searchOne(query) });
   }
 

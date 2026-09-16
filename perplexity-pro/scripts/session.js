@@ -18,6 +18,7 @@ const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Geck
 const API_VERSION = '2.18';
 const CDP_TIMEOUT_MS = 15000;
 const HTTP_TIMEOUT_MS = 60000; // ask streams can legitimately take a while
+const MAX_BODY_BYTES = 16 * 1048576; // guard against a runaway buffered response
 
 // Network.getCookies lives on a PAGE target: the browser-level endpoint only
 // exposes Browser.*/Target.* domains.
@@ -45,16 +46,20 @@ async function getCookies() {
   };
   let page = targets.find((t) => t.type === 'page' && isPerplexityUrl(t.url || ''));
   if (!page) {
-    // getCookies needs a page target, and Network.getCookies answers with the
-    // browser-scoped jar for ORIGIN, so any page is safe — but be explicit that
-    // this is a fallback, not a Perplexity tab.
-    page = targets.find((t) => t.type === 'page');
+    // No fallback to an arbitrary tab: Network.getCookies is partitioned by
+    // browser context, so an incognito/other-profile tab can answer with the
+    // wrong (or no) jar.
+    throw new Error('no Perplexity tab found in the OpenClaw browser; open https://www.perplexity.ai there first');
   }
-  if (!page || !page.webSocketDebuggerUrl) {
-    throw new Error('no page target in the OpenClaw browser (is it running?)');
-  }
+  if (!page.webSocketDebuggerUrl) throw new Error('the Perplexity tab exposes no debugger socket');
 
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  let ws;
+  try {
+    ws = new WebSocket(page.webSocketDebuggerUrl);
+  } catch (e) {
+    // Must not escape the finally block as a bare ReferenceError.
+    throw new Error(`could not create a CDP websocket: ${e.message}`);
+  }
   ws.onerror = () => {};   // handled by the promises below; avoids an unhandled 'error'
   try {
     await new Promise((resolve, reject) => {
@@ -85,7 +90,7 @@ async function getCookies() {
       ws.send(JSON.stringify({ id: 1, method: 'Network.getCookies', params: { urls: [ORIGIN] } }));
     });
   } finally {
-    ws.close();
+    try { ws.close(); } catch { /* already closed */ }
   }
 }
 
@@ -98,6 +103,16 @@ function csrfToken(cookies) {
   return hit.value.split('|')[0] || null;
 }
 
+/** Cookie header value: skip malformed entries and strip anything that could
+ *  inject a header separator. */
+function cookieHeader(cookies) {
+  const jar = Array.isArray(cookies) ? cookies : [];
+  return jar
+    .filter((c) => c && typeof c.name === 'string' && /^[\w.\-]+$/.test(c.name))
+    .map((c) => `${c.name}=${String(c.value === null || c.value === undefined ? '' : c.value).replace(/[\r\n;]/g, '')}`)
+    .join('; ');
+}
+
 async function internalFetch(pathname, cookies, init = {}) {
   const csrf = csrfToken(cookies);
   const res = await fetch(`${ORIGIN}${pathname}`, {
@@ -108,21 +123,44 @@ async function internalFetch(pathname, cookies, init = {}) {
     signal: init.signal
       ? AbortSignal.any([init.signal, AbortSignal.timeout(HTTP_TIMEOUT_MS)])
       : AbortSignal.timeout(HTTP_TIMEOUT_MS),
-    headers: {
-      'user-agent': UA,
-      accept: 'application/json, text/plain, */*',
-      ...(init.headers || {}),
-      // Auth headers are applied last: a caller must not be able to clobber them
-      // (that would break the session or misattribute the request).
-      cookie: cookies.map((c) => `${c.name}=${String(c.value).replace(/[\r\n;]/g, '')}`).join('; '),
-      ...(init.body ? { 'content-type': 'application/json' } : {}),
-      ...(csrf ? { 'x-csrf-token': csrf } : {}),
-    },
+    headers: (() => {
+      // Headers normalises case, so a caller passing `Cookie`/`X-CSRF-Token`
+      // cannot slip past the guard below (HTTP header names are case-insensitive).
+      const h = new Headers(init.headers || {});
+      h.set('user-agent', UA);
+      h.set('accept', 'application/json, text/plain, */*');
+      if (init.body) h.set('content-type', 'application/json');
+      // Auth headers are applied last: a caller must not be able to clobber
+      // them (that would break the session or misattribute the request).
+      h.set('cookie', cookieHeader(cookies));
+      if (csrf) h.set('x-csrf-token', csrf);
+      return h;
+    })(),
   });
-  const text = await res.text();
+  // res.text() buffers the whole body: cap it so a runaway stream (or a huge
+  // error page) cannot exhaust memory.
+  const text = await readCapped(res, MAX_BODY_BYTES);
   let body = null;
   try { body = JSON.parse(text); } catch { /* non-JSON (e.g. an HTML error page) */ }
   return { status: res.status, body, text };
+}
+
+async function readCapped(res, maxBytes) {
+  if (!res.body || typeof res.body.getReader !== 'function') return res.text();
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      try { await reader.cancel(); } catch { /* best effort */ }
+      throw new Error(`response exceeded ${Math.round(maxBytes / 1048576)} MiB`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 // Uniform failure reporting: redirects (an expired session) and 401/403 are the
@@ -300,6 +338,9 @@ function parseAskStream(text) {
 // the composer/menu/streaming fragility applies. Thread-scoped tokens come from
 // the thread itself.
 async function submitAsk(query, { threadUrl = null, cookies, modelPreference = 'pplx_alpha', mode = 'copilot' } = {}) {
+  if (typeof query !== 'string' || !query.trim()) {
+    throw new Error('query must be a non-empty string');
+  }
   const jar = cookies || await getCookies();
   let last = {};
   let slug = null;

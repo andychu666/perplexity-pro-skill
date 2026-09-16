@@ -68,9 +68,16 @@ function parseArgs(argv) {
 
   // Exactly one primary action per invocation: running several silently would do
   // hidden work (and print several unrelated reports). --thread alone is an
-  // action; with --ask it is just its target.
-  const actions = [opts.whoami, opts.history, opts.ask, opts.discover, opts.models]
-    .filter(Boolean).length + (opts.thread && !opts.ask ? 1 : 0);
+  // action; with --ask it is just its target. Compare against null, so an
+  // explicitly empty value is validated instead of counting as "no action".
+  for (const [name, value] of [['--thread', opts.thread], ['--ask', opts.ask], ['--history', opts.history], ['--model', opts.model]]) {
+    if (value !== null && !String(value).trim()) {
+      console.error(`Error: ${name} needs a non-empty value`);
+      process.exit(2);
+    }
+  }
+  const actions = [opts.whoami, opts.history !== null, opts.ask !== null, opts.discover, opts.models]
+    .filter(Boolean).length + (opts.thread !== null && opts.ask === null ? 1 : 0);
   if (actions === 0) { usage(); process.exit(1); }
   if (actions > 1) {
     console.error('Error: pass exactly one action (--whoami | --thread | --ask | --history | --discover | --models)');
@@ -92,7 +99,7 @@ try {
   console.error(`Error: could not read the browser session (${e.message}). Is the OpenClaw browser running?`);
   process.exit(1);
 }
-if (cookies.length === 0) {
+if (!Array.isArray(cookies) || cookies.length === 0) {
   console.error('Error: no Perplexity cookies found — is the openclaw profile logged in?');
   process.exit(1);
 }
@@ -111,7 +118,13 @@ if (opts.whoami) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(body, null, 2));
+    // /rest/user/info is account-scoped and carries identifiers (email, user id,
+    // subscription details). Dump the shape, not the values.
+    const redacted = {};
+    for (const [k, v] of Object.entries(body || {})) {
+      redacted[k] = typeof v === 'string' ? '<redacted>' : v;
+    }
+    console.log(JSON.stringify(redacted, null, 2));
   } else {
     console.log('session: OK');
     console.log('cookies:', cookies.length, '| csrf:', session.csrfToken(cookies) ? 'present' : 'missing');
@@ -130,6 +143,10 @@ if (opts.thread && !opts.ask) {
     process.exit(1);
   }
   const { thread, slug } = result;
+  if (!thread || typeof thread !== 'object') {
+    console.error('Error: the thread response was not an object');
+    process.exit(1);
+  }
   if (opts.json) {
     console.log(JSON.stringify(thread, null, 2));
   } else {
@@ -139,7 +156,7 @@ if (opts.thread && !opts.ask) {
     console.log('entries:', entries.length);
     for (const e of entries.slice(-3)) {
       const q = (e.query_str || e.query || '').replace(/\s+/g, ' ').slice(0, 70);
-      const a = session.entryAnswer(e).replace(/\s+/g, ' ').slice(0, 90);
+      const a = String(session.entryAnswer(e) || '').replace(/\s+/g, ' ').slice(0, 90);
       console.log(`  Q: ${q}`);
       if (a) console.log(`  A: ${a}${a.length >= 90 ? '...' : ''}`);
     }
@@ -149,7 +166,7 @@ if (opts.thread && !opts.ask) {
 if (opts.ask) {
   let result;
   try {
-    result = await session.submitAsk(opts.ask, { threadUrl: opts.thread, cookies, modelPreference: opts.model });
+    result = await session.submitAsk(opts.ask, { threadUrl: opts.thread, cookies, modelPreference: opts.model || undefined });
   } catch (e) {
     console.error(`Error: session ask failed (${e.message})`);
     process.exit(1);
@@ -173,8 +190,9 @@ if (opts.models) {
   if (opts.json) {
     console.log(JSON.stringify(info, null, 2));
   } else {
-    console.log(`models: ${info.models.length}`);
-    for (const m of info.models) {
+    const models = Array.isArray(info.models) ? info.models : [];
+    console.log(`models: ${models.length}`);
+    for (const m of models) {
       console.log(`  ${String(m.id).padEnd(28)} ${m.label}${m.mode ? `  [${m.mode}]` : ''}`);
     }
     if (info.defaults) console.log('defaults:', JSON.stringify(info.defaults));
@@ -192,8 +210,9 @@ if (opts.discover) {
   if (opts.json) {
     console.log(JSON.stringify(feed, null, 2));
   } else {
-    console.log(`discover: ${feed.items.length} item(s)`);
-    for (const s of feed.items) {
+    const items = Array.isArray(feed.items) ? feed.items : [];
+    console.log(`discover: ${items.length} item(s)`);
+    for (const s of items) {
       console.log(`  - ${s.title}`);
       if (s.summary) console.log(`    ${s.summary.replace(/\s+/g, ' ').slice(0, 110)}`);
       if (s.url) console.log(`    ${s.url}`);
@@ -210,9 +229,11 @@ if (opts.history) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify({ term: opts.history, count: hits.length, threads: hits }, null, 2));
+    const results = Array.isArray(hits) ? hits : [];
+    console.log(JSON.stringify({ term: opts.history, count: results.length, threads: results }, null, 2));
   } else {
-    console.log(`history: "${opts.history}" -> ${hits.length} thread(s)`);
+    const results = Array.isArray(hits) ? hits : [];
+    console.log(`history: "${opts.history}" -> ${results.length} thread(s)`);
     for (const t of hits) {
       const when = (t.updated_at || '').slice(0, 19).replace('T', ' ');
       console.log(`  - ${String(t.title || '(untitled)').slice(0, 70)}`);

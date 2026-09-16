@@ -24,6 +24,7 @@ const session = require('./session.js');
 function usage() {
   console.log(`Usage: perplexity-session.mjs --whoami
        perplexity-session.mjs [--json] --thread <thread-url-or-slug>
+       perplexity-session.mjs [--json] --ask "<question>" --thread <url>
        perplexity-session.mjs [--json] --history "<term>" [--limit N]
 
 Reuses the logged-in Perplexity session (cookies read over CDP) to query internal
@@ -31,7 +32,7 @@ endpoints without driving the UI. Cookies are never printed.`);
 }
 
 function parseArgs(argv) {
-  const opts = { whoami: false, thread: null, history: null, json: false, limit: 10 };
+  const opts = { whoami: false, thread: null, history: null, ask: null, json: false, limit: 10 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const need = (name) => {
@@ -43,6 +44,7 @@ function parseArgs(argv) {
     else if (a === '--json') opts.json = true;
     else if (a === '--thread') opts.thread = need(a);
     else if (a === '--history' || a === '--library') opts.history = need(a);
+    else if (a === '--ask') opts.ask = need(a);
     else if (a === '--limit') {
       const n = Number(need(a));
       if (!Number.isFinite(n) || n <= 0) { console.error('Error: --limit needs a positive integer'); process.exit(2); }
@@ -50,7 +52,8 @@ function parseArgs(argv) {
     } else if (a === '--help' || a === '-h') { usage(); process.exit(0); }
     else { console.error(`Error: unknown option ${a}`); process.exit(2); }
   }
-  if (!opts.whoami && !opts.thread && !opts.history) { usage(); process.exit(1); }
+  if (!opts.whoami && !opts.thread && !opts.history && !opts.ask) { usage(); process.exit(1); }
+  if (opts.ask && !opts.thread) { console.error('Error: --ask needs --thread <url>'); process.exit(2); }
   return opts;
 }
 
@@ -105,6 +108,22 @@ if (opts.thread) {
       console.log(`  Q: ${q}`);
       if (a) console.log(`  A: ${a}${a.length >= 90 ? '...' : ''}`);
     }
+  }
+}
+
+if (opts.ask) {
+  let result;
+  try {
+    result = await session.submitAsk(opts.ask, { threadUrl: opts.thread, cookies });
+  } catch (e) {
+    console.error(`Error: session ask failed (${e.message})`);
+    process.exit(1);
+  }
+  if (opts.json) {
+    console.log(JSON.stringify({ query: opts.ask, slug: result.slug, answer: result.answer }, null, 2));
+  } else {
+    console.log(result.answer || '[no answer]');
+    if (result.slug) console.log(`\nthread: ${session.ORIGIN}/search/${result.slug}`);
   }
 }
 

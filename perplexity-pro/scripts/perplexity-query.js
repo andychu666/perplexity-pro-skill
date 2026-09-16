@@ -575,6 +575,27 @@ async function runQuery(flags, query, timeoutMs) {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
 
     if (flags.chat) {
+      // Preferred path: submit the follow-up through the session layer. No
+      // composer, no menu, no stream settling — the thread is addressed by URL.
+      if (flags.thread) {
+        try {
+          const session = require('./session.js');
+          log('chat: submitting through the session layer (no UI)');
+          const asked = await session.submitAsk(query, { threadUrl: flags.thread });
+          if (asked.answer && asked.answer.trim()) {
+            log(`chat: answered via session (${asked.answer.length} chars)`);
+            return {
+              query, answer: asked.answer, mode: 'chat', isImageGeneration: false,
+              generatedImages: [], images: [], sources: [], screenshot: null,
+              url: asked.slug ? `https://www.perplexity.ai/search/${asked.slug}` : flags.thread,
+            };
+          }
+          log('Warning: session ask returned an empty answer; falling back to the UI');
+        } catch (e) {
+          log('Warning: session ask failed (' + e.message + '); falling back to the UI');
+        }
+      }
+
       let perplexityPage = null;
       const pages = await browser.pages();
       if (flags.thread) {

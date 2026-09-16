@@ -171,6 +171,97 @@ async function latestAnswer(slugOrUrl, { cookies, minEntries = 1 } = {}) {
   return { slug, answer: '', entries: entries.length };
 }
 
+// Block use cases the web client advertises. They are passed through verbatim
+// from a captured browser request so the server returns the same block set.
+const ASK_BLOCK_USE_CASES = [
+  'answer_modes', 'media_items', 'inline_entity_cards', 'place_widgets',
+  'finance_widgets', 'sports_widgets', 'news_widgets', 'shopping_widgets',
+  'jobs_widgets', 'search_result_widgets', 'inline_images', 'inline_assets',
+  'placeholder_cards', 'diff_blocks', 'entity_group_v2', 'refinement_filters',
+  'canvas_mode', 'maps_preview', 'answer_tabs', 'price_comparison_widgets',
+  'preserve_latex', 'generic_onboarding_widgets', 'in_context_suggestions',
+  'pending_followups', 'inline_claims', 'unified_assets', 'workflow_steps',
+  'workflow_widgets', 'navigation_results', 'background_agents',
+];
+
+// The ask stream is a series of `data: {...}` lines; the finished answer shows up
+// in blocks as markdown_block.answer (types: ask_text / ask_text_0_markdown).
+function parseAskStream(text) {
+  let answer = '';
+  let slug = null;
+  for (const line of String(text || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const raw = trimmed.slice(5).trim();
+    if (!raw || raw === '[DONE]') continue;
+    let payload;
+    try { payload = JSON.parse(raw); } catch { continue; }
+    if (payload.thread_url_slug) slug = payload.thread_url_slug;
+    const blocks = payload.blocks;
+    if (!Array.isArray(blocks)) continue;
+    for (const block of blocks) {
+      const markdown = block && block.markdown_block;
+      if (markdown && typeof markdown.answer === 'string' && markdown.answer.trim()) {
+        answer = markdown.answer;
+      }
+    }
+  }
+  return { answer, slug };
+}
+
+// Submit a query entirely through the session layer — no browser UI, so none of
+// the composer/menu/streaming fragility applies. Thread-scoped tokens come from
+// the thread itself.
+async function submitAsk(query, { threadUrl = null, cookies, modelPreference = 'pplx_alpha', mode = 'copilot' } = {}) {
+  const jar = cookies || await getCookies();
+  let last = {};
+  let slug = null;
+  if (threadUrl) {
+    const got = await getThread(threadUrl, { cookies: jar });
+    slug = got.slug;
+    const entries = Array.isArray(got.thread.entries) ? got.thread.entries : [];
+    last = entries[entries.length - 1] || {};
+  }
+
+  const params = {
+    last_backend_uuid: last.backend_uuid || null,
+    read_write_token: last.read_write_token || null,
+    attachments: [],
+    language: process.env.PPLX_LANGUAGE || 'en-US',
+    timezone: process.env.PPLX_TIMEZONE || 'UTC',
+    search_focus: 'internet',
+    sources: ['web'],
+    frontend_uuid: crypto.randomUUID(),
+    mode,
+    model_preference: modelPreference,
+    is_related_query: false,
+    is_sponsored: false,
+    prompt_source: 'user',
+    query_source: threadUrl ? 'followup' : 'user',
+    is_incognito: false,
+    time_from_first_type: 500,
+    local_search_enabled: false,
+    use_schematized_api: true,
+    send_back_text_in_streaming_api: false,
+    supported_block_use_cases: ASK_BLOCK_USE_CASES,
+    source: 'default',
+    always_search_override: false,
+    override_no_search: false,
+    version: '2.18',
+  };
+
+  const res = await internalFetch('/rest/sse/perplexity_ask', jar, {
+    method: 'POST',
+    headers: { accept: 'text/event-stream' },
+    body: JSON.stringify({ params, query_str: query }),
+  });
+  if (res.status !== 200) {
+    throw new Error(`perplexity_ask returned HTTP ${res.status}`);
+  }
+  const parsed = parseAskStream(res.text);
+  return { answer: parsed.answer, slug: parsed.slug || slug, cookies: jar };
+}
+
 module.exports = {
   CDP_URL,
   ORIGIN,
@@ -183,4 +274,6 @@ module.exports = {
   searchHistory,
   getThread,
   latestAnswer,
+  submitAsk,
+  parseAskStream,
 };

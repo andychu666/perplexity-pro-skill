@@ -262,7 +262,8 @@ if (opts.history) {
   // searchHistory returns {hits, truncated}; tolerate a bare array too.
   const results = Array.isArray(result) ? result
     : (result && Array.isArray(result.hits) ? result.hits : []);
-  if (result && result.truncated) {
+  const truncated = Boolean(result && result.truncated);
+  if (truncated) {
     console.error('Warning: history scan stopped early; results may be incomplete');
   }
   if (opts.json) {

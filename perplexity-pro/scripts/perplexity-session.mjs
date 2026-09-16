@@ -35,11 +35,17 @@ endpoints without driving the UI. Cookies are never printed.`);
 
 function parseArgs(argv) {
   const opts = { whoami: false, thread: null, history: null, ask: null, discover: false, models: false, model: null, json: false, limit: 10 };
+  const NEEDS_VALUE = new Set(['--thread', '--history', '--library', '--ask', '--model', '--limit']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const need = (name) => {
       const v = argv[++i];
-      if (v === undefined || v.startsWith('--')) { console.error(`Error: ${name} needs a value`); process.exit(2); }
+      // Only a missing value or another known flag means "no value": a query that
+      // legitimately starts with -- (e.g. --ask "--help me") must still work.
+      if (v === undefined || NEEDS_VALUE.has(v) || v === '--whoami' || v === '--json') {
+        console.error(`Error: ${name} needs a value`);
+        process.exit(2);
+      }
       return v;
     };
     if (a === '--whoami') opts.whoami = true;
@@ -51,13 +57,24 @@ function parseArgs(argv) {
     else if (a === '--discover') opts.discover = true;
     else if (a === '--models') opts.models = true;
     else if (a === '--limit') {
-      const n = Number(need(a));
-      if (!Number.isFinite(n) || n <= 0) { console.error('Error: --limit needs a positive integer'); process.exit(2); }
+      const raw = need(a);
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n <= 0) { console.error('Error: --limit needs a positive integer'); process.exit(2); }
       opts.limit = n;
     } else if (a === '--help' || a === '-h') { usage(); process.exit(0); }
     else { console.error(`Error: unknown option ${a}`); process.exit(2); }
   }
-  if (!opts.whoami && !opts.thread && !opts.history && !opts.ask && !opts.discover && !opts.models) { usage(); process.exit(1); }
+
+  // Exactly one primary action per invocation: running several silently would do
+  // hidden work (and print several unrelated reports). --thread alone is an
+  // action; with --ask it is just its target.
+  const actions = [opts.whoami, opts.history, opts.ask, opts.discover, opts.models]
+    .filter(Boolean).length + (opts.thread && !opts.ask ? 1 : 0);
+  if (actions === 0) { usage(); process.exit(1); }
+  if (actions > 1) {
+    console.error('Error: pass exactly one action (--whoami | --thread | --ask | --history | --discover | --models)');
+    process.exit(2);
+  }
   return opts;
 }
 
@@ -76,7 +93,14 @@ if (cookies.length === 0) {
 }
 
 if (opts.whoami) {
-  const { status, body } = await session.internalFetch('/rest/user/info', cookies);
+  let res;
+  try {
+    res = await session.internalFetch('/rest/user/info', cookies);
+  } catch (e) {
+    console.error(`Error: /rest/user/info request failed (${e.message})`);
+    process.exit(1);
+  }
+  const { status, body } = res;
   if (status !== 200) {
     console.error(`Error: /rest/user/info returned HTTP ${status} (session may have expired)`);
     process.exit(1);
@@ -173,7 +197,7 @@ if (opts.discover) {
 if (opts.history) {
   let hits;
   try {
-    hits = await session.searchHistory(opts.history, { limit: opts.limit });
+    hits = await session.searchHistory(opts.history, { limit: opts.limit, cookies });
   } catch (e) {
     console.error(`Error: history search failed (${e.message})`);
     process.exit(1);
@@ -184,8 +208,8 @@ if (opts.history) {
     console.log(`history: "${opts.history}" -> ${hits.length} thread(s)`);
     for (const t of hits) {
       const when = (t.updated_at || '').slice(0, 19).replace('T', ' ');
-      console.log(`  - ${t.title.slice(0, 70)}`);
-      console.log(`    ${t.url}${when ? `  (${when})` : ''}`);
+      console.log(`  - ${String(t.title || '(untitled)').slice(0, 70)}`);
+      console.log(`    ${t.url || '(no url)'}${when ? `  (${when})` : ''}`);
     }
   }
 }

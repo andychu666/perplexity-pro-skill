@@ -10,33 +10,53 @@
 //
 // CommonJS so both perplexity-query.js (CJS) and the .mjs helpers can use it.
 
+const { randomUUID } = require('node:crypto');
+
 const CDP_URL = process.env.PERPLEXITY_CDP || 'http://127.0.0.1:18800';
 const ORIGIN = 'https://www.perplexity.ai';
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36';
+const API_VERSION = '2.18';
+const CDP_TIMEOUT_MS = 15000;
+const HTTP_TIMEOUT_MS = 60000; // ask streams can legitimately take a while
 
 // Network.getCookies lives on a PAGE target: the browser-level endpoint only
 // exposes Browser.*/Target.* domains.
 async function getCookies() {
-  const targets = await (await fetch(`${CDP_URL}/json/list`)).json();
+  // Node <21 has no global WebSocket; fail with a reason instead of a bare
+  // ReferenceError.
+  if (typeof WebSocket === 'undefined') {
+    throw new Error('no global WebSocket (needs Node 21+) - cannot read the browser session');
+  }
+
+  const listRes = await fetch(`${CDP_URL}/json/list`, { signal: AbortSignal.timeout(CDP_TIMEOUT_MS) });
+  if (!listRes.ok) throw new Error(`CDP /json/list returned HTTP ${listRes.status}`);
+  const targets = await listRes.json();
+  if (!Array.isArray(targets)) throw new Error('CDP /json/list did not return an array');
+
   const page = targets.find((t) => t.type === 'page' && /perplexity\.ai/.test(t.url || ''))
     || targets.find((t) => t.type === 'page');
   if (!page || !page.webSocketDebuggerUrl) throw new Error('no page target in the OpenClaw browser');
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = () => reject(new Error('could not open a CDP websocket'));
-  });
+  ws.onerror = () => {};   // handled by the promises below; avoids an unhandled 'error'
   try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('CDP websocket handshake timed out')), CDP_TIMEOUT_MS);
+      ws.onopen = () => { clearTimeout(timer); resolve(); };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('could not open a CDP websocket')); };
+    });
     return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('CDP getCookies timed out')), CDP_TIMEOUT_MS);
+      // Settle once: late frames (or a late timeout) must not double-settle.
+      const settle = (fn, value) => { clearTimeout(timer); ws.onmessage = null; fn(value); };
       ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.id !== 1) return;
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)));
-        else resolve(msg.result.cookies || []);
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; } // keepalive/partial frame
+        if (!msg || msg.id !== 1) return;
+        if (msg.error) settle(reject, new Error(JSON.stringify(msg.error)));
+        else settle(resolve, (msg.result && msg.result.cookies) || []);
       };
       ws.send(JSON.stringify({ id: 1, method: 'Network.getCookies', params: { urls: [ORIGIN] } }));
-      setTimeout(() => reject(new Error('CDP getCookies timed out')), 15000);
     });
   } finally {
     ws.close();
@@ -53,6 +73,8 @@ async function internalFetch(pathname, cookies, init = {}) {
   const res = await fetch(`${ORIGIN}${pathname}`, {
     ...init,
     redirect: 'manual',
+    // Bounded: an unbounded fetch here would hang the caller forever.
+    signal: init.signal || AbortSignal.timeout(HTTP_TIMEOUT_MS),
     headers: {
       cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; '),
       'user-agent': UA,
@@ -68,9 +90,27 @@ async function internalFetch(pathname, cookies, init = {}) {
   return { status: res.status, body, text };
 }
 
+// Uniform failure reporting: redirects (an expired session) and 401/403 are the
+// cases a caller must be able to tell apart from a plain 500.
+function failureReason(res, what) {
+  const snippet = String(res.text || '').replace(/\s+/g, ' ').slice(0, 160);
+  if (res.status >= 300 && res.status < 400) {
+    return new Error(`${what} redirected (HTTP ${res.status}) - the Perplexity session looks expired; re-login in the OpenClaw browser`);
+  }
+  if (res.status === 401 || res.status === 403) {
+    return new Error(`${what} refused (HTTP ${res.status}) - session may have expired or lack permission${snippet ? `: ${snippet}` : ''}`);
+  }
+  return new Error(`${what} returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+}
+
 function threadSlug(value) {
   const m = String(value).match(/(?:search|thread)\/([A-Za-z0-9_-]+)/);
-  return m ? m[1] : String(value).replace(/^\/+|\/+$/g, '');
+  // Reject anything that is not a plain slug: the value ends up in a URL path.
+  const slug = m ? m[1] : String(value).replace(/^\/+|\/+$/g, '');
+  if (!/^[A-Za-z0-9_-]+$/.test(slug)) {
+    throw new Error(`invalid thread reference: ${String(value).slice(0, 80)}`);
+  }
+  return slug;
 }
 
 function parseSteps(text) {
@@ -93,7 +133,9 @@ function entryAnswer(entry) {
   for (let i = steps.length - 1; i >= 0; i--) {
     const content = steps[i] && steps[i].content;
     if (!content || typeof content !== 'object') continue;
-    const raw = content.answer != null ? content.answer : (content.markdown != null ? content.markdown : content.text);
+    const raw = content.answer !== undefined ? content.answer
+      : content.markdown !== undefined ? content.markdown
+      : content.text;
     if (typeof raw !== 'string' || !raw.trim()) continue;
     try {
       const inner = JSON.parse(raw);
@@ -104,15 +146,14 @@ function entryAnswer(entry) {
   return '';
 }
 
-async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {  const jar = cookies || await getCookies();
-  const { status, body } = await internalFetch('/rest/thread/list_ask_threads', jar, {
+async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
+  const jar = cookies || await getCookies();
+  const res = await internalFetch('/rest/thread/list_ask_threads', jar, {
     method: 'POST',
     body: JSON.stringify({ limit, offset, source: 'default' }),
   });
-  if (status !== 200 || !Array.isArray(body)) {
-    throw new Error(`thread list returned HTTP ${status}`);
-  }
-  return { cookies: jar, threads: body };
+  if (res.status !== 200 || !Array.isArray(res.body)) throw failureReason(res, 'thread list');
+  return { cookies: jar, threads: res.body };
 }
 
 async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}) {
@@ -123,6 +164,7 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
   // scan large pages instead: the endpoint serves up to 200 per request.
   const hits = [];
   let skipped = 0;
+  const MAX_SCAN = 600;
 
   for (let page = 0; page < pages; page++) {
     let threads;
@@ -133,8 +175,12 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       break;
     }
     if (threads.length === 0) break;
+    let hitCap = false;
     for (const t of threads) {
-      if (skipped++ >= 600) break;
+      // Stop scanning entirely at the cap: breaking only the inner loop would
+      // keep fetching pages that can never be used.
+      if (skipped >= MAX_SCAN) { hitCap = true; break; }
+      skipped++;
       const haystack = `${t.title || ''} ${t.query_str || ''} ${t.answer_preview || ''}`.toLowerCase();
       if (!needle || haystack.includes(needle)) {
         hits.push({
@@ -146,17 +192,16 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
         });
       }
     }
-    if (hits.length >= limit) break;
+    if (hitCap || hits.length >= limit) break;
   }
   return hits.slice(0, limit);
 }
-
 async function getThread(slugOrUrl, { cookies } = {}) {
   const jar = cookies || await getCookies();
   const slug = threadSlug(slugOrUrl);
-  const { status, body } = await internalFetch(`/rest/thread/${slug}`, jar);
-  if (status !== 200 || !body) throw new Error(`thread ${slug} returned HTTP ${status}`);
-  return { cookies: jar, slug, thread: body };
+  const res = await internalFetch(`/rest/thread/${slug}`, jar);
+  if (res.status !== 200 || !res.body) throw failureReason(res, `thread ${slug}`);
+  return { cookies: jar, slug, thread: res.body };
 }
 
 // Latest answer text in a thread — used to read back a chat follow-up without
@@ -232,13 +277,15 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     timezone: process.env.PPLX_TIMEZONE || 'UTC',
     search_focus: 'internet',
     sources: ['web'],
-    frontend_uuid: crypto.randomUUID(),
+    frontend_uuid: randomUUID(),
     mode,
     model_preference: modelPreference,
     is_related_query: false,
     is_sponsored: false,
     prompt_source: 'user',
-    query_source: threadUrl ? 'followup' : 'user',
+    // Only a real thread continuation is a follow-up; a new thread must not claim
+    // to be one (the server relies on this for placement).
+    query_source: threadUrl && last.read_write_token ? 'followup' : 'user',
     is_incognito: false,
     time_from_first_type: 500,
     local_search_enabled: false,
@@ -248,7 +295,7 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     source: 'default',
     always_search_override: false,
     override_no_search: false,
-    version: '2.18',
+    version: API_VERSION,
   };
 
   const res = await internalFetch('/rest/sse/perplexity_ask', jar, {
@@ -256,9 +303,7 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     headers: { accept: 'text/event-stream' },
     body: JSON.stringify({ params, query_str: query }),
   });
-  if (res.status !== 200) {
-    throw new Error(`perplexity_ask returned HTTP ${res.status}`);
-  }
+  if (res.status !== 200) throw failureReason(res, 'perplexity_ask');
   const parsed = parseAskStream(res.text);
   let answer = parsed.answer;
   const answerSlug = parsed.slug || slug;
@@ -289,19 +334,19 @@ function storyFrom(item) {
 
 async function discoverFeed({ limit = 20, offset = 0, cookies } = {}) {
   const jar = cookies || await getCookies();
-  const { status, body } = await internalFetch(
-    `/rest/discover/feed?limit=${limit}&offset=${offset}&version=2.18&source=default`, jar);
-  if (status !== 200 || !body) throw new Error(`discover feed returned HTTP ${status}`);
-  const items = Array.isArray(body.items) ? body.items : [];
-  return { cookies: jar, items: items.map(storyFrom), nextToken: body.next_token || null };
+  const res = await internalFetch(
+    `/rest/discover/feed?limit=${limit}&offset=${offset}&version=${API_VERSION}&source=default`, jar);
+  if (res.status !== 200 || !res.body) throw failureReason(res, 'discover feed');
+  const items = Array.isArray(res.body.items) ? res.body.items : [];
+  return { cookies: jar, items: items.map(storyFrom), nextToken: res.body.next_token || null };
 }
 
 async function discoverTopics({ cookies } = {}) {
   const jar = cookies || await getCookies();
-  const { status, body } = await internalFetch('/rest/discover/topics?version=2.18&source=default', jar);
-  if (status !== 200 || !body) throw new Error(`discover topics returned HTTP ${status}`);
-  const all = Array.isArray(body.all_topics) ? body.all_topics : [];
-  const selected = Array.isArray(body.user_selected_topics) ? body.user_selected_topics : [];
+  const res = await internalFetch(`/rest/discover/topics?version=${API_VERSION}&source=default`, jar);
+  if (res.status !== 200 || !res.body) throw failureReason(res, 'discover topics');
+  const all = Array.isArray(res.body.all_topics) ? res.body.all_topics : [];
+  const selected = Array.isArray(res.body.user_selected_topics) ? res.body.user_selected_topics : [];
   return {
     cookies: jar,
     selected: selected.map((t) => t.topic || t.title || t.key || String(t)),
@@ -313,9 +358,9 @@ async function discoverTopics({ cookies } = {}) {
 
 async function listModels({ cookies } = {}) {
   const jar = cookies || await getCookies();
-  const { status, body } = await internalFetch('/rest/models/config/v2?version=2.18&source=default', jar);
-  if (status !== 200 || !body) throw new Error(`model config returned HTTP ${status}`);
-  const models = body.models || {};
+  const res = await internalFetch(`/rest/models/config/v2?version=${API_VERSION}&source=default`, jar);
+  if (res.status !== 200 || !res.body) throw failureReason(res, 'model config');
+  const models = res.body.models || {};
   const entries = Array.isArray(models)
     ? models.map((m, i) => ({ id: m.id || m.model || String(i), ...m }))
     : Object.entries(models).map(([id, m]) => ({ id, ...m }));
@@ -328,7 +373,7 @@ async function listModels({ cookies } = {}) {
       mode: m.mode || null,
       provider: m.provider || null,
     })),
-    defaults: body.default_models || null,
+    defaults: res.body.default_models || null,
   };
 }
 

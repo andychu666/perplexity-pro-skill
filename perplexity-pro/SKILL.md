@@ -291,6 +291,24 @@ ask Perplexity about itself.**
 - Use `--chat` to follow up on a previous query in the same thread
 - Use `--url` to ask Perplexity to analyze a specific webpage
 
+## Session reuse (no UI driving)
+
+The OpenClaw Chrome profile already holds a signed-in Perplexity Pro session.
+`scripts/perplexity-session.mjs` reads its cookies over CDP (including the
+httpOnly session cookies) and pairs the CSRF cookie with an `x-csrf-token`
+header, so internal endpoints can be called without clicking through the UI:
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread https://www.perplexity.ai/search/<slug>
+node scripts/perplexity-session.mjs --json --thread <slug>
+```
+
+Cookies are never printed and never written to disk. This is the least brittle
+layer (no menu selectors, no composer typing, no stream waiting) — prefer it for
+reading threads and session checks, and fall back to the UI path for actions that
+only exist there (Computer mode, model switching, Discover).
+
 ## Deep research via the Agent API (preferred when a key is set)
 
 `--deep` through the browser is fragile (the mode lives in the composer's `/`

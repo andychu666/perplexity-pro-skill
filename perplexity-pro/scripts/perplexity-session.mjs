@@ -115,7 +115,7 @@ const REDACT = Symbol('redact');
 // `read_write_token`s that authorise follow-ups. No credential may reach stdout,
 // logs or CI captures. Only real credentials are dropped: pagination cursors
 // such as next_token stay, since they are not secrets.
-const SECRET_KEY = /^(cookies?|csrf[a-z_]*|read_write_token|authorization|[a-z_]*secret|[a-z_]*password)$/i;
+const SECRET_KEY = /^(cookies?|csrf[a-z_]*|authorization|api_?key|jwt|session_?id|access_?token|refresh_?token|id_?token|[a-z_]*write_token|[a-z_]*secret|[a-z_]*password)$/i;
 function withoutSecrets(value) {
   if (Array.isArray(value)) return value.map(withoutSecrets);
   if (!value || typeof value !== 'object') return value;

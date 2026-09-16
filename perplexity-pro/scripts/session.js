@@ -350,7 +350,11 @@ async function latestAnswer(slugOrUrl, { cookies, minEntries = 1 } = {}) {
   const { thread, slug } = await getThread(slugOrUrl, { cookies });
   const entries = Array.isArray(thread.entries) ? thread.entries : [];
   if (entries.length < minEntries) return { slug, answer: '', entries: entries.length };
-  for (let i = entries.length - 1; i >= 0; i--) {
+  // Never walk back past the entries the caller had already seen: a new entry
+  // that is not filled in yet would otherwise surface the *previous* turn's
+  // answer as this turn's reply.
+  const start = Math.max(0, Math.min(minEntries - 1, entries.length - 1));
+  for (let i = entries.length - 1; i >= start; i--) {
     const answer = entryAnswer(entries[i]);
     if (answer) return { slug, answer, entries: entries.length };
   }

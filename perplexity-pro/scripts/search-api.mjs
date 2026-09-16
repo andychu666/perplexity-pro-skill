@@ -49,12 +49,14 @@ if (!apiKey) {
 const MAX_RESULTS = 5;
 const SNIPPET_CHARS = 300;
 
+const SEARCH_API_URL = "https://api.perplexity.ai/search";
+
 async function searchOne(query) {
   // Without a timeout a stalled connection hangs the CLI forever with no output.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
   try {
-    const response = await fetch("https://api.perplexity.ai/search", {
+    const response = await fetch(SEARCH_API_URL, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${apiKey}`,
@@ -119,11 +121,18 @@ function formatItems(items, query) {
 
 try {
   // One request per query: each result keeps its own label, and a batch never
-  // gets attributed to queries[0].
+  // gets attributed to queries[0]. Requests run concurrently (offsets are
+  // independent) and one failure must not discard the queries that worked.
+  const settled = await Promise.allSettled(cleanQueries.map((q) => searchOne(q)));
   const collected = [];
-  for (const query of cleanQueries) {
-    collected.push({ query, result: await searchOne(query) });
-  }
+  settled.forEach((outcome, i) => {
+    if (outcome.status === "fulfilled") {
+      collected.push({ query: cleanQueries[i], result: outcome.value });
+    } else {
+      console.error(`Error: query "${cleanQueries[i]}" failed: ${outcome.reason.message}`);
+    }
+  });
+  if (collected.length === 0) process.exit(1);
 
   if (jsonOutput) {
     const payload =

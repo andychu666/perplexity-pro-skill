@@ -187,7 +187,8 @@ async function readCapped(res, maxBytes) {
 // Uniform failure reporting: redirects (an expired session) and 401/403 are the
 // cases a caller must be able to tell apart from a plain 500.
 function failureReason(res, what) {
-  const snippet = String(res.text || '').replace(/\s+/g, ' ').slice(0, 160);
+  // Slice before normalising: res.text can be megabytes on a runaway error page.
+  const snippet = String(res.text || '').slice(0, 512).replace(/\s+/g, ' ').slice(0, 160);
   if (res.status >= 300 && res.status < 400) {
     return new Error(`${what} redirected (HTTP ${res.status}) - the Perplexity session looks expired; re-login in the OpenClaw browser`);
   }
@@ -265,6 +266,9 @@ async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
 async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}) {
   const jar = await getCookies();
   const needle = String(term || '').toLowerCase().trim();
+  const safeLimit = toInt(limit, 10);
+  const safePages = toInt(pages, 3);
+  const safePerPage = Math.min(toInt(perPage, 200), 200);
   // No server-side thread search exists (list_ask_threads ignores a `query`
   // field, and the GraphQL endpoint only accepts allow-listed operations), so
   // scan large pages instead: the endpoint serves up to 200 per request.
@@ -273,10 +277,10 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
   let truncated = false;
   const MAX_SCAN = 600;
 
-  for (let page = 0; page < pages; page++) {
+  for (let page = 0; page < safePages; page++) {
     let threads;
     try {
-      ({ threads } = await listThreads({ cookies: jar, limit: perPage, offset: page * perPage }));
+      ({ threads } = await listThreads({ cookies: jar, limit: safePerPage, offset: page * safePerPage }));
     } catch (e) {
       // A transient failure mid-scan can keep the partial hits, but an expired
       // session (or any auth/redirect failure) must surface, not look like
@@ -302,12 +306,12 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       }
     }
     if (hitCap) truncated = true;
-    if (hitCap || hits.length >= limit) break;
+    if (hitCap || hits.length >= safeLimit) break;
   }
-  const out = hits.slice(0, limit);
-  // Non-enumerable so array semantics are unchanged, but callers can tell a
-  // partial scan from a complete one.
-  if (truncated) Object.defineProperty(out, 'truncated', { value: true, enumerable: false });
+  const out = hits.slice(0, safeLimit);
+  // Enumerable so it survives inspection; note that JSON.stringify of an array
+  // drops non-index properties, so the CLI also warns on stderr.
+  if (truncated) Object.defineProperty(out, 'truncated', { value: true, enumerable: true });
   return out;
 }
 async function getThread(slugOrUrl, { cookies } = {}) {
@@ -401,10 +405,12 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
   const jar = cookies || await getCookies();
   let last = {};
   let slug = null;
+  let entriesBefore = 0;
   if (threadUrl) {
     const got = await getThread(threadUrl, { cookies: jar });
     slug = got.slug;
     const entries = Array.isArray(got.thread.entries) ? got.thread.entries : [];
+    entriesBefore = entries.length;
     last = entries[entries.length - 1] || {};
   }
 
@@ -450,7 +456,9 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     // The stream sometimes carries only the plan/search blocks; the finished text
     // then lands on the thread itself, so read it back before giving up.
     try {
-      const read = await latestAnswer(answerSlug, { cookies: jar });
+      // Require a NEW entry: if the ask produced none, the read-back would
+      // otherwise return the previous turn's answer as if it were the reply.
+      const read = await latestAnswer(answerSlug, { cookies: jar, minEntries: entriesBefore + 1 });
       if (read.answer && read.answer.trim()) answer = read.answer;
     } catch (e) {
       // An empty read is fine, but an expired session must not be reported as
@@ -480,8 +488,10 @@ function storyFrom(item) {
 
 async function discoverFeed({ limit = 20, offset = 0, cookies } = {}) {
   const jar = cookies || await getCookies();
+  const safeLimit = toInt(limit, 20);
+  const safeOffset = toInt(offset, 0);
   const res = await internalFetch(
-    `/rest/discover/feed?limit=${limit}&offset=${offset}&version=${API_VERSION}&source=default`, jar);
+    `/rest/discover/feed?limit=${safeLimit}&offset=${safeOffset}&version=${API_VERSION}&source=default`, jar);
   if (res.status !== 200 || !res.body) throw failureReason(res, 'discover feed');
   const items = Array.isArray(res.body.items) ? res.body.items : [];
   return { cookies: jar, items: items.map(storyFrom).filter(Boolean), nextToken: res.body.next_token || null };

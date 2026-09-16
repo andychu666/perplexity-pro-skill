@@ -41,10 +41,12 @@ function parseArgs(argv) {
     const a = argv[i];
     const need = (name) => {
       const v = argv[++i];
-      // Only a missing value or another known flag means "no value": a query that
-      // legitimately starts with -- (e.g. --ask "--help me") must still work,
-      // but a bare unknown flag (--bogus) is a mistake worth reporting.
-      if (v === undefined || NEEDS_VALUE.has(v) || BOOLEAN_FLAGS.has(v) || /^--[a-z][a-z-]*$/.test(v)) {
+      // A missing value is an error. Another known flag is an error too. A bare
+      // unknown flag (--bogus) is only an error for structured options:
+      // --ask/--history take free text, so "--foo" can be a legitimate query.
+      const freeText = name === '--ask' || name === '--history' || name === '--library';
+      if (v === undefined || NEEDS_VALUE.has(v) || BOOLEAN_FLAGS.has(v)
+          || (!freeText && /^--[a-z][a-z-]*$/.test(v))) {
         console.error(`Error: ${name} needs a value`);
         process.exit(2);
       }

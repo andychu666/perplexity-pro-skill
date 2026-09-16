@@ -2,10 +2,41 @@
 // Session API verbs: threads, ask, history, discover and models. All transport
 // (CDP cookies, CSRF pairing, bounded fetch, failure classification) comes from
 // session-core.js — this module is the endpoint surface only.
+const { randomUUID } = require('node:crypto'); // submitAsk's frontend_uuid
 const {
   API_VERSION, ORIGIN, getCookies, internalFetch, failureReason,
   isAuthFailure, toInt, threadSlug, entryAnswer,
 } = require('./session-core.js');
+
+// --- Shared response guard --------------------------------------------------
+// Every fetcher goes through assertBody, so a 200 that does not carry the
+// expected payload is a loud failure (SHAPE) instead of a silent empty result.
+// An expired session used to look like "no data" on three separate paths.
+function shapeError(what, detail) {
+  const err = new Error(`${what}: unexpected response shape (${detail}) - the endpoint may have changed`);
+  err.code = 'SHAPE';
+  return err;
+}
+
+function assertBody(res, what, ok, detail) {
+  if (res.status !== 200) throw failureReason(res, what);
+  if (!ok(res.body)) throw shapeError(what, detail);
+  return res.body;
+}
+
+// --- Per-thread ask lock ----------------------------------------------------
+// Two overlapping asks on the same thread both read the same "last entry"
+// token and then race, so one answer can be written into the other's slot.
+const threadLocks = new Map();
+
+function withThreadLock(key, fn) {
+  const prev = threadLocks.get(key) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  threadLocks.set(key, run.catch(() => {})); // never poison the chain
+  return run.finally(() => {
+    if (threadLocks.get(key) === run.catch(() => {})) threadLocks.delete(key);
+  });
+}
 
 async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
   const jar = cookies || await getCookies();
@@ -15,15 +46,17 @@ async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
     method: 'POST',
     body: JSON.stringify({ limit: safeLimit, offset: safeOffset, source: 'default' }),
   });
-  if (res.status !== 200 || !Array.isArray(res.body)) throw failureReason(res, 'thread list');
-  return { cookies: jar, threads: res.body };
+  const threads = assertBody(res, 'thread list', Array.isArray, 'expected an array of threads');
+  return { cookies: jar, threads };
 }
 
 async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}) {
   const jar = await getCookies();
   const needle = String(term || '').toLowerCase().trim();
-  const safeLimit = toInt(limit, 10);
-  const safePages = toInt(pages, 3);
+  // Bounded: unclamped pages/limit let one call fire hundreds of requests and
+  // hold the process for hours.
+  const safeLimit = Math.min(toInt(limit, 10), 500);
+  const safePages = Math.min(toInt(pages, 3), 10);
   const safePerPage = Math.min(toInt(perPage, 200), 200);
   // No server-side thread search exists (list_ask_threads ignores a `query`
   // field, and the GraphQL endpoint only accepts allow-listed operations), so
@@ -31,6 +64,7 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
   const hits = [];
   let skipped = 0;
   let truncated = false;
+  let scanError = null;
   const MAX_SCAN = 600;
 
   for (let page = 0; page < safePages; page++) {
@@ -42,7 +76,10 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       // session (or any auth/redirect failure) must surface, not look like
       // "no more results".
       if (page === 0 || isAuthFailure(e)) throw e;
-      truncated = true; // partial: the caller must be able to tell
+      // Partial AND reported: a mid-scan failure must not look like a scan that
+      // finished and simply found nothing. Keep the reason for the caller.
+      truncated = true;
+      scanError = scanError || (e && e.message ? e.message : String(e));
       break;
     }
     if (threads.length === 0) break;
@@ -75,16 +112,20 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
     // result is partial and the caller must be told.
     if (page === safePages - 1 && threads.length >= safePerPage) truncated = true;
   }
+  // Dropping matches to honour the caller's limit is itself a partial result.
+  if (hits.length > safeLimit) truncated = true;
   // An object, not a decorated array: JSON.stringify drops non-index array
   // properties, so the truncation flag would vanish for API consumers.
-  return { hits: hits.slice(0, safeLimit), truncated };
+  return { hits: hits.slice(0, safeLimit), truncated, ...(scanError ? { error: scanError } : {}) };
 }
 async function getThread(slugOrUrl, { cookies } = {}) {
   const jar = cookies || await getCookies();
   const slug = threadSlug(slugOrUrl);
   const res = await internalFetch(`/rest/thread/${slug}`, jar);
-  if (res.status !== 200 || !res.body) throw failureReason(res, `thread ${slug}`);
-  return { cookies: jar, slug, thread: res.body };
+  const thread = assertBody(res, `thread ${slug}`,
+    (b) => b && typeof b === 'object' && Array.isArray(b.entries),
+    'expected a thread object with an entries array');
+  return { cookies: jar, slug, thread };
 }
 
 // Latest answer text in a thread — used to read back a chat follow-up without
@@ -122,18 +163,41 @@ const ASK_BLOCK_USE_CASES = [
 // this endpoint also emits one JSON object per line — so try the joined form
 // first and fall back to per-line parsing.
 function parseAskStream(text) {
-  let answer = '';
+  const answers = [];
   let slug = null;
+  let streamError = null;
+
+  // The stream re-sends a block as it grows (and may send several distinct
+  // blocks), so a naive append duplicates the answer and keeping only the last
+  // one truncates it. Track the most complete version of each block: exact
+  // repeats are dropped, a longer version of a known block replaces it, and a
+  // shorter prefix of a known block is ignored.
+  const keep = (raw) => {
+    const t = String(raw || '').trim();
+    if (!t) return;
+    if (answers.includes(t)) return;
+    const grown = answers.findIndex((a) => t.startsWith(a));
+    if (grown >= 0) { answers[grown] = t; return; }
+    if (answers.some((a) => a.startsWith(t))) return;
+    answers.push(t);
+  };
 
   const handlePayload = (payload) => {
+    if (!payload || typeof payload !== 'object') return;
     if (payload.thread_url_slug) slug = payload.thread_url_slug;
+    // A stream-level failure arrives as a normal 200 frame carrying `error`;
+    // without this it looks like "no answer yet" and the ask is reported empty.
+    if (payload.error) {
+      streamError = typeof payload.error === 'string'
+        ? payload.error
+        : (payload.error.message || JSON.stringify(payload.error));
+      return;
+    }
     const blocks = payload.blocks;
     if (!Array.isArray(blocks)) return;
     for (const block of blocks) {
       const markdown = block && block.markdown_block;
-      if (markdown && typeof markdown.answer === 'string' && markdown.answer.trim()) {
-        answer = markdown.answer;
-      }
+      if (markdown && typeof markdown.answer === 'string') keep(markdown.answer);
     }
   };
 
@@ -161,13 +225,21 @@ function parseAskStream(text) {
     if (parsedJoined) consume(joined);
     else for (const line of dataLines) consume(line.trim());
   }
-  return { answer, slug };
+  return { answer: answers.join('\n\n'), slug, error: streamError };
 }
 
 // Submit a query entirely through the session layer — no browser UI, so none of
 // the composer/menu/streaming fragility applies. Thread-scoped tokens come from
 // the thread itself.
-async function submitAsk(query, { threadUrl = null, cookies, modelPreference = 'pplx_alpha', mode = 'copilot' } = {}) {
+// Serialised per thread: see withThreadLock. Without a thread there is nothing
+// to interleave, so this is a straight pass-through.
+async function submitAsk(query, opts = {}) {
+  const { threadUrl = null } = opts;
+  if (!threadUrl) return submitAskOnce(query, opts);
+  return withThreadLock(threadSlug(threadUrl), () => submitAskOnce(query, opts));
+}
+
+async function submitAskOnce(query, { threadUrl = null, cookies, modelPreference = 'pplx_alpha', mode = 'copilot' } = {}) {
   if (typeof query !== 'string' || !query.trim()) {
     throw new Error('query must be a non-empty string');
   }
@@ -219,6 +291,7 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
   });
   if (res.status !== 200) throw failureReason(res, 'perplexity_ask');
   const parsed = parseAskStream(res.text);
+  if (parsed.error) throw new Error(`perplexity_ask stream error: ${parsed.error}`);
   let answer = parsed.answer;
   const answerSlug = parsed.slug || slug;
   if ((!answer || !answer.trim()) && answerSlug) {
@@ -236,6 +309,13 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
       // empty string, so reaching this catch always means the read broke.
       throw e;
     }
+  }
+  if (!answer || !answer.trim()) {
+    // An empty answer after the read-back is a failure, not a success: it is how
+    // an expired session or a rate limit used to masquerade as "no answer yet".
+    const err = new Error('ask produced no answer (empty stream and empty thread read-back) - session may be expired or rate limited');
+    err.code = 'EMPTY_ANSWER';
+    throw err;
   }
   return { answer, slug: answerSlug, cookies: jar };
 }
@@ -263,21 +343,26 @@ async function discoverFeed({ limit = 20, offset = 0, cookies } = {}) {
   const safeOffset = toInt(offset, 0);
   const res = await internalFetch(
     `/rest/discover/feed?limit=${safeLimit}&offset=${safeOffset}&version=${API_VERSION}&source=default`, jar);
-  if (res.status !== 200 || !res.body) throw failureReason(res, 'discover feed');
-  const items = Array.isArray(res.body.items) ? res.body.items : [];
-  return { cookies: jar, items: items.map(storyFrom).filter(Boolean), nextToken: res.body.next_token || null };
+  const body = assertBody(res, 'discover feed',
+    (b) => b && typeof b === 'object' && Array.isArray(b.items),
+    'expected an items array');
+  return { cookies: jar, items: body.items.map(storyFrom).filter(Boolean), nextToken: body.next_token || null };
 }
 
 async function discoverTopics({ cookies } = {}) {
   const jar = cookies || await getCookies();
   const res = await internalFetch(`/rest/discover/topics?version=${API_VERSION}&source=default`, jar);
-  if (res.status !== 200 || !res.body) throw failureReason(res, 'discover topics');
-  const all = Array.isArray(res.body.all_topics) ? res.body.all_topics : [];
-  const selected = Array.isArray(res.body.user_selected_topics) ? res.body.user_selected_topics : [];
+  const body = assertBody(res, 'discover topics',
+    (b) => b && typeof b === 'object' && Array.isArray(b.all_topics),
+    'expected an all_topics array');
+  const selected = Array.isArray(body.user_selected_topics) ? body.user_selected_topics : [];
+  // Elements can be null: the server has done it for topics, and an unguarded
+  // property read would surface as an opaque TypeError instead of a topic list.
+  const label = (t) => (t && typeof t === 'object' ? (t.topic || t.title || t.key || null) : t) ?? '(unnamed)';
   return {
     cookies: jar,
-    selected: selected.map((t) => t.topic || t.title || t.key || String(t)),
-    all: all.map((t) => t.topic || t.title || t.key || String(t)),
+    selected: selected.map(label),
+    all: body.all_topics.map(label),
   };
 }
 
@@ -286,8 +371,10 @@ async function discoverTopics({ cookies } = {}) {
 async function listModels({ cookies } = {}) {
   const jar = cookies || await getCookies();
   const res = await internalFetch(`/rest/models/config/v2?version=${API_VERSION}&source=default`, jar);
-  if (res.status !== 200 || !res.body) throw failureReason(res, 'model config');
-  const models = res.body.models || {};
+  const body = assertBody(res, 'model config',
+    (b) => b && typeof b === 'object' && b.models !== undefined && b.models !== null,
+    'expected a models payload');
+  const models = body.models;
   const entries = Array.isArray(models)
     // Spread first: a trailing `...m` would clobber the computed fallback, and
     // the server sometimes sends `id: null` next to a usable `model` field.
@@ -302,7 +389,7 @@ async function listModels({ cookies } = {}) {
       mode: m.mode || null,
       provider: m.provider || null,
     })),
-    defaults: res.body.default_models || null,
+    defaults: body.default_models || null,
   };
 }
 

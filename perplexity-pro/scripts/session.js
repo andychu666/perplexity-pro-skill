@@ -64,8 +64,16 @@ async function getCookies() {
   try {
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('CDP websocket handshake timed out')), CDP_TIMEOUT_MS);
-      ws.onopen = () => { clearTimeout(timer); resolve(); };
-      ws.onerror = () => { clearTimeout(timer); reject(new Error('could not open a CDP websocket')); };
+      const done = (fn, value) => {
+        clearTimeout(timer);
+        ws.onopen = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        fn(value);
+      };
+      ws.onopen = () => done(resolve);
+      ws.onclose = () => done(reject, new Error('CDP websocket closed during the handshake'));
+      ws.onerror = () => done(reject, new Error('could not open a CDP websocket'));
     });
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('CDP getCookies timed out')), CDP_TIMEOUT_MS);
@@ -127,9 +135,11 @@ async function internalFetch(pathname, cookies, init = {}) {
       // Headers normalises case, so a caller passing `Cookie`/`X-CSRF-Token`
       // cannot slip past the guard below (HTTP header names are case-insensitive).
       const h = new Headers(init.headers || {});
-      h.set('user-agent', UA);
-      h.set('accept', 'application/json, text/plain, */*');
-      if (init.body) h.set('content-type', 'application/json');
+      // Only fill in defaults the caller did not set: submitAsk asks for
+      // text/event-stream, and clobbering it would break the stream.
+      if (!h.has('user-agent')) h.set('user-agent', UA);
+      if (!h.has('accept')) h.set('accept', 'application/json, text/plain, */*');
+      if (init.body && !h.has('content-type')) h.set('content-type', 'application/json');
       // Auth headers are applied last: a caller must not be able to clobber
       // them (that would break the session or misattribute the request).
       h.set('cookie', cookieHeader(cookies));
@@ -146,19 +156,30 @@ async function internalFetch(pathname, cookies, init = {}) {
 }
 
 async function readCapped(res, maxBytes) {
-  if (!res.body || typeof res.body.getReader !== 'function') return res.text();
-  const reader = res.body.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.length;
-    if (total > maxBytes) {
-      try { await reader.cancel(); } catch { /* best effort */ }
+  const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
+  if (!reader) {
+    // Still enforce the cap: an uncapped fallback would defeat the guard.
+    const text = await res.text();
+    if (Buffer.byteLength(text) > maxBytes) {
       throw new Error(`response exceeded ${Math.round(maxBytes / 1048576)} MiB`);
     }
-    chunks.push(Buffer.from(value));
+    return text;
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* best effort */ }
+        throw new Error(`response exceeded ${Math.round(maxBytes / 1048576)} MiB`);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
   }
   return Buffer.concat(chunks).toString('utf8');
 }
@@ -174,6 +195,13 @@ function failureReason(res, what) {
     return new Error(`${what} refused (HTTP ${res.status}) - session may have expired or lack permission${snippet ? `: ${snippet}` : ''}`);
   }
   return new Error(`${what} returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`);
+}
+
+/** Coerce a caller-supplied number to a sane non-negative integer so it can be
+ *  interpolated into a query string safely. */
+function toInt(value, fallback) {
+  const n = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.trunc(n) : fallback;
 }
 
 function threadSlug(value) {
@@ -224,9 +252,11 @@ function entryAnswer(entry) {
 
 async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
   const jar = cookies || await getCookies();
+  const safeLimit = toInt(limit, 10);
+  const safeOffset = toInt(offset, 0);
   const res = await internalFetch('/rest/thread/list_ask_threads', jar, {
     method: 'POST',
-    body: JSON.stringify({ limit, offset, source: 'default' }),
+    body: JSON.stringify({ limit: safeLimit, offset: safeOffset, source: 'default' }),
   });
   if (res.status !== 200 || !Array.isArray(res.body)) throw failureReason(res, 'thread list');
   return { cookies: jar, threads: res.body };
@@ -240,6 +270,7 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
   // scan large pages instead: the endpoint serves up to 200 per request.
   const hits = [];
   let skipped = 0;
+  let truncated = false;
   const MAX_SCAN = 600;
 
   for (let page = 0; page < pages; page++) {
@@ -251,17 +282,16 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       // session (or any auth/redirect failure) must surface, not look like
       // "no more results".
       if (page === 0 || /401|403|redirect|expired|refused/i.test(e.message)) throw e;
+      truncated = true; // partial: the caller must be able to tell
       break;
     }
     if (threads.length === 0) break;
     let hitCap = false;
     for (const t of threads) {
-      // Stop scanning entirely at the cap: breaking only the inner loop would
-      // keep fetching pages that can never be used.
       if (skipped >= MAX_SCAN) { hitCap = true; break; }
       skipped++;
-      const haystack = `${t.title || ''} ${t.query_str || ''} ${t.answer_preview || ''}`.toLowerCase();
-      if (!needle || haystack.includes(needle)) {
+      const haystack = `${(t && t.title) || ''} ${(t && t.query_str) || ''} ${(t && t.answer_preview) || ''}`.toLowerCase();
+      if (t && typeof t === 'object' && (!needle || haystack.includes(needle))) {
         hits.push({
           title: t.title || '(untitled)',
           slug: t.slug,
@@ -271,9 +301,14 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
         });
       }
     }
+    if (hitCap) truncated = true;
     if (hitCap || hits.length >= limit) break;
   }
-  return hits.slice(0, limit);
+  const out = hits.slice(0, limit);
+  // Non-enumerable so array semantics are unchanged, but callers can tell a
+  // partial scan from a complete one.
+  if (truncated) Object.defineProperty(out, 'truncated', { value: true, enumerable: false });
+  return out;
 }
 async function getThread(slugOrUrl, { cookies } = {}) {
   const jar = cookies || await getCookies();
@@ -309,27 +344,49 @@ const ASK_BLOCK_USE_CASES = [
   'workflow_widgets', 'navigation_results', 'background_agents',
 ];
 
-// The ask stream is a series of `data: {...}` lines; the finished answer shows up
-// in blocks as markdown_block.answer (types: ask_text / ask_text_0_markdown).
+// The ask stream is a series of `data:` lines carrying JSON. Per the SSE spec a
+// frame may spread its payload over several `data:` lines (joined with \n), but
+// this endpoint also emits one JSON object per line — so try the joined form
+// first and fall back to per-line parsing.
 function parseAskStream(text) {
   let answer = '';
   let slug = null;
-  for (const line of String(text || '').split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) continue;
-    const raw = trimmed.slice(5).trim();
-    if (!raw || raw === '[DONE]') continue;
-    let payload;
-    try { payload = JSON.parse(raw); } catch { continue; }
+
+  const handlePayload = (payload) => {
     if (payload.thread_url_slug) slug = payload.thread_url_slug;
     const blocks = payload.blocks;
-    if (!Array.isArray(blocks)) continue;
+    if (!Array.isArray(blocks)) return;
     for (const block of blocks) {
       const markdown = block && block.markdown_block;
       if (markdown && typeof markdown.answer === 'string' && markdown.answer.trim()) {
         answer = markdown.answer;
       }
     }
+  };
+
+  const consume = (raw) => {
+    if (!raw || raw === '[DONE]') return;
+    let payload;
+    try { payload = JSON.parse(raw); } catch { return; }
+    handlePayload(payload);
+  };
+
+  // Blank line separates frames; a frame's payload is the joined data lines.
+  for (const frame of String(text || '').split(/\r?\n\r?\n/)) {
+    const dataLines = [];
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (dataLines.length === 0) continue;
+    if (dataLines.length === 1) {
+      consume(dataLines[0].trim());
+      continue;
+    }
+    const joined = dataLines.join('\n').trim();
+    let parsedJoined = false;
+    try { JSON.parse(joined); parsedJoined = true; } catch { /* not one object */ }
+    if (parsedJoined) consume(joined);
+    else for (const line of dataLines) consume(line.trim());
   }
   return { answer, slug };
 }
@@ -407,7 +464,10 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
 // --- Discover (no UI) -------------------------------------------------------
 
 function storyFrom(item) {
-  const preview = Array.isArray(item.web_results_preview?.first_urls) ? item.web_results_preview.first_urls[0] : null;
+  if (!item || typeof item !== 'object') return null;
+  const preview = Array.isArray(item.web_results_preview && item.web_results_preview.first_urls)
+    ? item.web_results_preview.first_urls[0]
+    : null;
   return {
     title: item.title || item.short_title || '(untitled)',
     summary: item.summary || item.description || null,
@@ -424,7 +484,7 @@ async function discoverFeed({ limit = 20, offset = 0, cookies } = {}) {
     `/rest/discover/feed?limit=${limit}&offset=${offset}&version=${API_VERSION}&source=default`, jar);
   if (res.status !== 200 || !res.body) throw failureReason(res, 'discover feed');
   const items = Array.isArray(res.body.items) ? res.body.items : [];
-  return { cookies: jar, items: items.map(storyFrom), nextToken: res.body.next_token || null };
+  return { cookies: jar, items: items.map(storyFrom).filter(Boolean), nextToken: res.body.next_token || null };
 }
 
 async function discoverTopics({ cookies } = {}) {

@@ -42,8 +42,9 @@ function parseArgs(argv) {
     const need = (name) => {
       const v = argv[++i];
       // Only a missing value or another known flag means "no value": a query that
-      // legitimately starts with -- (e.g. --ask "--help me") must still work.
-      if (v === undefined || NEEDS_VALUE.has(v) || BOOLEAN_FLAGS.has(v)) {
+      // legitimately starts with -- (e.g. --ask "--help me") must still work,
+      // but a bare unknown flag (--bogus) is a mistake worth reporting.
+      if (v === undefined || NEEDS_VALUE.has(v) || BOOLEAN_FLAGS.has(v) || /^--[a-z][a-z-]*$/.test(v)) {
         console.error(`Error: ${name} needs a value`);
         process.exit(2);
       }
@@ -78,13 +79,15 @@ function parseArgs(argv) {
   }
   const actions = [opts.whoami, opts.history !== null, opts.ask !== null, opts.discover, opts.models]
     .filter(Boolean).length + (opts.thread !== null && opts.ask === null ? 1 : 0);
+  if (opts.model && !opts.ask) {
+    // Checked before the action count: a lone --model must not fall through to
+    // the generic usage error.
+    console.error('Error: --model only applies to --ask');
+    process.exit(2);
+  }
   if (actions === 0) { usage(); process.exit(1); }
   if (actions > 1) {
     console.error('Error: pass exactly one action (--whoami | --thread | --ask | --history | --discover | --models)');
-    process.exit(2);
-  }
-  if (opts.model && !opts.ask) {
-    console.error('Error: --model only applies to --ask');
     process.exit(2);
   }
   return opts;
@@ -104,6 +107,20 @@ if (!Array.isArray(cookies) || cookies.length === 0) {
   process.exit(1);
 }
 
+const REDACT = Symbol('redact');
+// Deep redaction: nested objects/arrays and numeric identifiers leak the same
+// account data as top-level strings.
+function redactValue(value) {
+  if (typeof value === 'string' || typeof value === 'number') return '<redacted>';
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = redactValue(v);
+    return out;
+  }
+  return value; // booleans/null carry no identity
+}
+
 if (opts.whoami) {
   let res;
   try {
@@ -119,12 +136,8 @@ if (opts.whoami) {
   }
   if (opts.json) {
     // /rest/user/info is account-scoped and carries identifiers (email, user id,
-    // subscription details). Dump the shape, not the values.
-    const redacted = {};
-    for (const [k, v] of Object.entries(body || {})) {
-      redacted[k] = typeof v === 'string' ? '<redacted>' : v;
-    }
-    console.log(JSON.stringify(redacted, null, 2));
+    // subscription details). Dump the shape, not the values — at any depth.
+    console.log(JSON.stringify(redactValue(body || {}), null, 2));
   } else {
     console.log('session: OK');
     console.log('cookies:', cookies.length, '| csrf:', session.csrfToken(cookies) ? 'present' : 'missing');
@@ -228,13 +241,15 @@ if (opts.history) {
     console.error(`Error: history search failed (${e.message})`);
     process.exit(1);
   }
+  const results = Array.isArray(hits) ? hits : [];
+  if (results.truncated) {
+    console.error('Warning: history scan stopped early; results may be incomplete');
+  }
   if (opts.json) {
-    const results = Array.isArray(hits) ? hits : [];
     console.log(JSON.stringify({ term: opts.history, count: results.length, threads: results }, null, 2));
   } else {
-    const results = Array.isArray(hits) ? hits : [];
     console.log(`history: "${opts.history}" -> ${results.length} thread(s)`);
-    for (const t of hits) {
+    for (const t of results) {
       const when = (t.updated_at || '').slice(0, 19).replace('T', ' ');
       console.log(`  - ${String(t.title || '(untitled)').slice(0, 70)}`);
       console.log(`    ${t.url || '(no url)'}${when ? `  (${when})` : ''}`);

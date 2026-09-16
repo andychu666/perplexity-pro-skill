@@ -111,11 +111,20 @@ if (!Array.isArray(cookies) || cookies.length === 0) {
 
 const REDACT = Symbol('redact');
 // The session helper returns the live cookie jar alongside its payload (the
-// caller chains it into the next request). It must never reach stdout or logs.
-function withoutCookies(value) {
+// caller chains it into the next request), and thread entries carry per-thread
+// `read_write_token`s that authorise follow-ups. No credential may reach stdout,
+// logs or CI captures. Only real credentials are dropped: pagination cursors
+// such as next_token stay, since they are not secrets.
+const SECRET_KEY = /^(cookies?|csrf[a-z_]*|read_write_token|authorization|[a-z_]*secret|[a-z_]*password)$/i;
+function withoutSecrets(value) {
+  if (Array.isArray(value)) return value.map(withoutSecrets);
   if (!value || typeof value !== 'object') return value;
-  const { cookies, ...rest } = value;
-  return rest;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (SECRET_KEY.test(k)) continue;
+    out[k] = withoutSecrets(v);
+  }
+  return out;
 }
 // Deep redaction: nested objects/arrays and numeric identifiers leak the same
 // account data as top-level strings.
@@ -170,7 +179,7 @@ if (opts.thread && !opts.ask) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(thread, null, 2));
+    console.log(JSON.stringify(withoutSecrets(thread), null, 2));
   } else {
     const entries = Array.isArray(thread.entries) ? thread.entries : [];
     console.log('thread:', thread.slug || slug);
@@ -194,7 +203,7 @@ if (opts.ask) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify({ query: opts.ask, slug: result.slug, answer: result.answer }, null, 2));
+    console.log(JSON.stringify(withoutSecrets({ query: opts.ask, slug: result.slug, answer: result.answer }), null, 2));
   } else {
     console.log(result.answer || '[no answer]');
     if (result.slug) console.log(`\nthread: ${session.ORIGIN}/search/${result.slug}`);
@@ -210,7 +219,7 @@ if (opts.models) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(withoutCookies(info), null, 2));
+    console.log(JSON.stringify(withoutSecrets(info), null, 2));
   } else {
     const models = Array.isArray(info.models) ? info.models : [];
     console.log(`models: ${models.length}`);
@@ -230,7 +239,7 @@ if (opts.discover) {
     process.exit(1);
   }
   if (opts.json) {
-    console.log(JSON.stringify(withoutCookies(feed), null, 2));
+    console.log(JSON.stringify(withoutSecrets(feed), null, 2));
   } else {
     const items = Array.isArray(feed.items) ? feed.items : [];
     console.log(`discover: ${items.length} item(s)`);
@@ -257,7 +266,7 @@ if (opts.history) {
     console.error('Warning: history scan stopped early; results may be incomplete');
   }
   if (opts.json) {
-    console.log(JSON.stringify({ term: opts.history, count: results.length, threads: results }, null, 2));
+    console.log(JSON.stringify(withoutSecrets({ term: opts.history, count: results.length, threads: results, truncated }), null, 2));
   } else {
     console.log(`history: "${opts.history}" -> ${results.length} thread(s)`);
     for (const t of results) {

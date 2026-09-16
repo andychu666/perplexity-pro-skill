@@ -841,13 +841,17 @@ async function runHistory(query, limit) {
   // the shell-rendering/overlay fragility of scraping the Library UI.
   try {
     const session = require('./session.js');
-    const hits = await session.searchHistory(oneLineQuery, { limit });
+    const result = await session.searchHistory(oneLineQuery, { limit });
+    // searchHistory resolves to {hits, truncated}; tolerate a bare array too.
+    const hits = Array.isArray(result) ? result
+      : (result && Array.isArray(result.hits) ? result.hits : []);
     log(`history: session search matched ${hits.length} thread(s)`);
     return {
       mode: 'history',
       query: oneLineQuery,
       count: hits.length,
       threads: hits,
+      truncated: Boolean(result && result.truncated),
       screenshot: null,
       url: 'https://www.perplexity.ai/library',
     };

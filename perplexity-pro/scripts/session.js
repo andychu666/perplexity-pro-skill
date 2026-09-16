@@ -336,7 +336,14 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
       }
     }
     if (hitCap) truncated = true;
-    if (hitCap || hits.length >= safeLimit) break;
+    if (hitCap || hits.length >= safeLimit) {
+      // Stopping for the caller's limit (or the scan cap) while pages are
+      // still left means matches may remain unscanned: the result is partial
+      // even though it is exactly what was asked for. On the last page there
+      // is nothing left to scan, so it stays complete.
+      if (page < safePages - 1) truncated = true;
+      break;
+    }
     // The loop can also end by exhausting the page budget. If that last page
     // came back full, more threads may exist beyond what we scanned, so the
     // result is partial and the caller must be told.
@@ -556,8 +563,10 @@ async function listModels({ cookies } = {}) {
   if (res.status !== 200 || !res.body) throw failureReason(res, 'model config');
   const models = res.body.models || {};
   const entries = Array.isArray(models)
-    ? models.map((m, i) => ({ id: m.id || m.model || String(i), ...m }))
-    : Object.entries(models).map(([id, m]) => ({ id, ...m }));
+    // Spread first: a trailing `...m` would clobber the computed fallback, and
+    // the server sometimes sends `id: null` next to a usable `model` field.
+    ? models.map((m, i) => ({ ...m, id: (m && (m.id || m.model)) || String(i) }))
+    : Object.entries(models).map(([id, m]) => ({ ...m, id }));
   return {
     cookies: jar,
     models: entries.map((m) => ({

@@ -152,7 +152,13 @@ async function internalFetch(pathname, cookies, init = {}) {
   const text = await readCapped(res, MAX_BODY_BYTES);
   let body = null;
   try { body = JSON.parse(text); } catch { /* non-JSON (e.g. an HTML error page) */ }
-  return { status: res.status, body, text };
+  // `redirect: 'manual'` makes undici return a spec-mandated opaque-redirect
+  // response: status 0, type 'opaqueredirect', empty headers and body. That 0
+  // would slip past every 3xx check below, so an expired session would look
+  // like a plain HTTP 0 failure instead of a redirect. Normalise it to 302 so
+  // failureReason() and isAuthFailure() classify it as the expired session it is.
+  const opaqueRedirect = res.type === 'opaqueredirect';
+  return { status: opaqueRedirect ? 302 : res.status, body, text };
 }
 
 async function readCapped(res, maxBytes) {
@@ -331,6 +337,10 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
     }
     if (hitCap) truncated = true;
     if (hitCap || hits.length >= safeLimit) break;
+    // The loop can also end by exhausting the page budget. If that last page
+    // came back full, more threads may exist beyond what we scanned, so the
+    // result is partial and the caller must be told.
+    if (page === safePages - 1 && threads.length >= safePerPage) truncated = true;
   }
   // An object, not a decorated array: JSON.stringify drops non-index array
   // properties, so the truncation flag would vanish for API consumers.
@@ -487,9 +497,11 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
       const read = await latestAnswer(answerSlug, { cookies: jar, minEntries: entriesBefore + 1 });
       if (read.answer && read.answer.trim()) answer = read.answer;
     } catch (e) {
-      // An empty read is fine, but an expired session must not be reported as
-      // "empty answer".
-      if (isAuthFailure(e)) throw e;
+      // No silent fallback here: a read-back that throws (HTTP 500, timeout,
+      // network error) is a real failure, and reporting it as an empty answer
+      // would hide it. `latestAnswer` signals "no answer yet" by returning an
+      // empty string, so reaching this catch always means the read broke.
+      throw e;
     }
   }
   return { answer, slug: answerSlug, cookies: jar };

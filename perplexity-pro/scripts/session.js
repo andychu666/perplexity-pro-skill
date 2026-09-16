@@ -33,9 +33,26 @@ async function getCookies() {
   const targets = await listRes.json();
   if (!Array.isArray(targets)) throw new Error('CDP /json/list did not return an array');
 
-  const page = targets.find((t) => t.type === 'page' && /perplexity\.ai/.test(t.url || ''))
-    || targets.find((t) => t.type === 'page');
-  if (!page || !page.webSocketDebuggerUrl) throw new Error('no page target in the OpenClaw browser');
+  // Match the real host, not a substring: a tab on perplexity.ai.evil.com must
+  // never be mistaken for the logged-in Perplexity session.
+  const isPerplexityUrl = (u) => {
+    try {
+      const host = new URL(u).hostname.toLowerCase();
+      return host === 'perplexity.ai' || host === 'www.perplexity.ai' || host.endsWith('.perplexity.ai');
+    } catch {
+      return false;
+    }
+  };
+  let page = targets.find((t) => t.type === 'page' && isPerplexityUrl(t.url || ''));
+  if (!page) {
+    // getCookies needs a page target, and Network.getCookies answers with the
+    // browser-scoped jar for ORIGIN, so any page is safe — but be explicit that
+    // this is a fallback, not a Perplexity tab.
+    page = targets.find((t) => t.type === 'page');
+  }
+  if (!page || !page.webSocketDebuggerUrl) {
+    throw new Error('no page target in the OpenClaw browser (is it running?)');
+  }
 
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   ws.onerror = () => {};   // handled by the promises below; avoids an unhandled 'error'
@@ -47,8 +64,15 @@ async function getCookies() {
     });
     return await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('CDP getCookies timed out')), CDP_TIMEOUT_MS);
-      // Settle once: late frames (or a late timeout) must not double-settle.
-      const settle = (fn, value) => { clearTimeout(timer); ws.onmessage = null; fn(value); };
+      // Settle once: late frames, a late timeout or a dropped socket must not
+      // double-settle (and a socket drop must not hang until the timeout).
+      const settle = (fn, value) => {
+        clearTimeout(timer);
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        fn(value);
+      };
       ws.onmessage = (ev) => {
         let msg;
         try { msg = JSON.parse(ev.data); } catch { return; } // keepalive/partial frame
@@ -56,6 +80,8 @@ async function getCookies() {
         if (msg.error) settle(reject, new Error(JSON.stringify(msg.error)));
         else settle(resolve, (msg.result && msg.result.cookies) || []);
       };
+      ws.onclose = () => settle(reject, new Error('CDP websocket closed before replying'));
+      ws.onerror = () => settle(reject, new Error('CDP websocket errored before replying'));
       ws.send(JSON.stringify({ id: 1, method: 'Network.getCookies', params: { urls: [ORIGIN] } }));
     });
   } finally {
@@ -64,8 +90,12 @@ async function getCookies() {
 }
 
 function csrfToken(cookies) {
-  const hit = cookies.find((c) => c.name === 'next-auth.csrf-token' || /csrf/i.test(c.name));
-  return hit ? hit.value.split('|')[0] : null;
+  if (!Array.isArray(cookies)) return null;
+  // Prefer the exact cookie name; the regex is only a fallback.
+  const hit = cookies.find((c) => c && c.name === 'next-auth.csrf-token')
+    || cookies.find((c) => c && typeof c.name === 'string' && /csrf/i.test(c.name));
+  if (!hit || typeof hit.value !== 'string') return null;
+  return hit.value.split('|')[0] || null;
 }
 
 async function internalFetch(pathname, cookies, init = {}) {
@@ -73,15 +103,20 @@ async function internalFetch(pathname, cookies, init = {}) {
   const res = await fetch(`${ORIGIN}${pathname}`, {
     ...init,
     redirect: 'manual',
-    // Bounded: an unbounded fetch here would hang the caller forever.
-    signal: init.signal || AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    // Bounded: an unbounded fetch here would hang the caller forever. A caller
+    // signal is combined with the timeout instead of replacing it.
+    signal: init.signal
+      ? AbortSignal.any([init.signal, AbortSignal.timeout(HTTP_TIMEOUT_MS)])
+      : AbortSignal.timeout(HTTP_TIMEOUT_MS),
     headers: {
-      cookie: cookies.map((c) => `${c.name}=${c.value}`).join('; '),
       'user-agent': UA,
       accept: 'application/json, text/plain, */*',
+      ...(init.headers || {}),
+      // Auth headers are applied last: a caller must not be able to clobber them
+      // (that would break the session or misattribute the request).
+      cookie: cookies.map((c) => `${c.name}=${String(c.value).replace(/[\r\n;]/g, '')}`).join('; '),
       ...(init.body ? { 'content-type': 'application/json' } : {}),
       ...(csrf ? { 'x-csrf-token': csrf } : {}),
-      ...(init.headers || {}),
     },
   });
   const text = await res.text();
@@ -104,11 +139,14 @@ function failureReason(res, what) {
 }
 
 function threadSlug(value) {
-  const m = String(value).match(/(?:search|thread)\/([A-Za-z0-9_-]+)/);
+  const raw = String(value).trim();
+  // Match the slug at a path boundary AND at the end of the value, so
+  // "search/abc/def" is rejected instead of silently truncating to "abc".
+  const m = raw.match(/(?:^|\/)(?:search|thread)\/([A-Za-z0-9_-]+)\/?(?:[?#].*)?$/);
+  const slug = m ? m[1] : raw.replace(/^\/+|\/+$/g, '');
   // Reject anything that is not a plain slug: the value ends up in a URL path.
-  const slug = m ? m[1] : String(value).replace(/^\/+|\/+$/g, '');
   if (!/^[A-Za-z0-9_-]+$/.test(slug)) {
-    throw new Error(`invalid thread reference: ${String(value).slice(0, 80)}`);
+    throw new Error(`invalid thread reference: ${raw.slice(0, 80)}`);
   }
   return slug;
 }
@@ -171,7 +209,10 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
     try {
       ({ threads } = await listThreads({ cookies: jar, limit: perPage, offset: page * perPage }));
     } catch (e) {
-      if (page === 0) throw e;
+      // A transient failure mid-scan can keep the partial hits, but an expired
+      // session (or any auth/redirect failure) must surface, not look like
+      // "no more results".
+      if (page === 0 || /401|403|redirect|expired|refused/i.test(e.message)) throw e;
       break;
     }
     if (threads.length === 0) break;
@@ -313,7 +354,11 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     try {
       const read = await latestAnswer(answerSlug, { cookies: jar });
       if (read.answer && read.answer.trim()) answer = read.answer;
-    } catch { /* keep the empty answer; the caller can retry */ }
+    } catch (e) {
+      // An empty read is fine, but an expired session must not be reported as
+      // "empty answer".
+      if (/401|403|redirect|expired|refused/i.test(e.message)) throw e;
+    }
   }
   return { answer, slug: answerSlug, cookies: jar };
 }

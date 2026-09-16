@@ -36,13 +36,14 @@ endpoints without driving the UI. Cookies are never printed.`);
 function parseArgs(argv) {
   const opts = { whoami: false, thread: null, history: null, ask: null, discover: false, models: false, model: null, json: false, limit: 10 };
   const NEEDS_VALUE = new Set(['--thread', '--history', '--library', '--ask', '--model', '--limit']);
+  const BOOLEAN_FLAGS = new Set(['--whoami', '--json', '--discover', '--models', '--help', '-h']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const need = (name) => {
       const v = argv[++i];
       // Only a missing value or another known flag means "no value": a query that
       // legitimately starts with -- (e.g. --ask "--help me") must still work.
-      if (v === undefined || NEEDS_VALUE.has(v) || v === '--whoami' || v === '--json') {
+      if (v === undefined || NEEDS_VALUE.has(v) || BOOLEAN_FLAGS.has(v)) {
         console.error(`Error: ${name} needs a value`);
         process.exit(2);
       }
@@ -73,6 +74,10 @@ function parseArgs(argv) {
   if (actions === 0) { usage(); process.exit(1); }
   if (actions > 1) {
     console.error('Error: pass exactly one action (--whoami | --thread | --ask | --history | --discover | --models)');
+    process.exit(2);
+  }
+  if (opts.model && !opts.ask) {
+    console.error('Error: --model only applies to --ask');
     process.exit(2);
   }
   return opts;
@@ -114,7 +119,9 @@ if (opts.whoami) {
   }
 }
 
-if (opts.thread) {
+// --thread is the target of --ask, not a second action: run this only when no ask
+// was requested, or the thread would be fetched and printed twice.
+if (opts.thread && !opts.ask) {
   let result;
   try {
     result = await session.getThread(opts.thread, { cookies });

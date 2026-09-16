@@ -291,6 +291,21 @@ ask Perplexity about itself.**
 - Use `--chat` to follow up on a previous query in the same thread
 - Use `--url` to ask Perplexity to analyze a specific webpage
 
+## API fallback (search-api.mjs)
+
+When the browser is unavailable, `scripts/search-api.mjs` queries the official
+Perplexity Search API instead:
+
+```bash
+export PERPLEXITY_API_KEY=pplx-...
+node scripts/search-api.mjs "your question" --json
+node scripts/search-api.mjs "q1" "q2" --timeout 90
+```
+
+Each query is sent as its own request (the API expects a single `query` string),
+so batch results keep their per-query label. Requires `PERPLEXITY_API_KEY`;
+without a key the script exits with a clear error rather than an empty result.
+
 ## Troubleshooting
 
 - **"Could not connect to browser"**: Make sure Chrome is running on `:9222`. Check with `curl -s http://127.0.0.1:9222/json/version`.

@@ -15,6 +15,7 @@ const path = require('path');
 // have to reinstall if they already have it.
 function loadPuppeteer() {
   const candidates = [
+    path.join(process.env.HOME || '', 'node_modules', 'puppeteer-core'),
     'puppeteer-core',
     path.join(__dirname, '..', 'node_modules', 'puppeteer-core'),
     process.env.PUPPETEER_CORE_PATH,
@@ -52,6 +53,7 @@ Options:
   --brief            Append "Answer briefly in 2-3 sentences"
   --detailed         Append "Provide a detailed, comprehensive answer"
   --chat             Continue in existing Perplexity thread
+  --thread <URL>     Thread to continue (with --chat); opened if no tab matches
   --url <URL>        Prepend a URL for Perplexity to analyze (http/https)
   --deep             Enable Deep Research mode (10 min timeout)
   --computer         Use Computer mode (30 min timeout)
@@ -63,7 +65,7 @@ Options:
   --                 End of options; everything after is treated as query text`;
 
 function parseArgs(argv) {
-  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, history: false, limit: 10, help: false };
+  const flags = { brief: false, detailed: false, chat: false, thread: null, url: null, deep: false, computer: false, discover: null, history: false, limit: 10, help: false };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     // `--` ends option parsing: everything after is query text, verbatim.
@@ -74,6 +76,20 @@ function parseArgs(argv) {
       case '--brief': flags.brief = true; break;
       case '--detailed': flags.detailed = true; break;
       case '--chat': flags.chat = true; break;
+      case '--thread': {
+        if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) { console.error('ERROR: --thread requires a URL argument'); process.exit(1); }
+        if (flags.thread !== null) { console.error('ERROR: --thread specified multiple times'); process.exit(1); }
+        const threadUrl = argv[++i];
+        try {
+          const parsed = new URL(threadUrl);
+          if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.endsWith('perplexity.ai')) {
+            console.error('ERROR: --thread must be a perplexity.ai http(s) URL');
+            process.exit(1);
+          }
+        } catch { console.error('ERROR: --thread value is not a valid URL'); process.exit(1); }
+        flags.thread = threadUrl;
+        break;
+      }
       case '--deep': flags.deep = true; break;
       case '--computer': flags.computer = true; break;
       case '--history':
@@ -187,6 +203,41 @@ async function findFollowUpInput(page) {
     for (let i = els.length - 1; i >= 0; i--) { const visible = await els[i].evaluate(e => e.offsetHeight > 0); if (visible) return els[i]; }
   }
   return null;
+}
+
+async function waitForFollowUpInput(page, timeoutMs = 20000) {
+  // The thread view renders its composer after hydration, and Chrome may have
+  // discarded a background tab (URL kept, DOM gone) — so poll, and reload once if
+  // the page reports no composer at all despite being "complete".
+  const deadline = Date.now() + timeoutMs;
+  let attempt = 0;
+  let reloaded = false;
+  for (;;) {
+    attempt++;
+    const input = await findFollowUpInput(page);
+    if (input) return input;
+
+    const probe = await page.evaluate(() => ({
+      ce: document.querySelectorAll('[contenteditable="true"]').length,
+      ta: document.querySelectorAll('textarea').length,
+      ready: document.readyState,
+      bodyChildren: document.body ? document.body.childElementCount : -1,
+    })).catch(() => null);
+
+    if (process.env.PPLX_DEBUG_INPUT) log(`input probe #${attempt}: ${JSON.stringify(probe)}`);
+
+    if (!reloaded && probe && probe.ready === 'complete'
+        && probe.ce === 0 && probe.ta === 0 && attempt >= 2) {
+      reloaded = true;
+      log('No composer found and the page looks discarded; reloading once');
+      try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e) { log('Warning: reload failed: ' + e.message); }
+      await sleep(2500);
+      continue;
+    }
+
+    if (Date.now() > deadline) return null;
+    await sleep(1000);
+  }
 }
 
 async function dismissModals(page) {
@@ -377,7 +428,22 @@ async function typeQuery(page, input, query) {
   }
 }
 
-async function waitForAnswer(page, timeoutMs, flags) {
+// Count the prose/markdown blocks currently mounted. Callers snapshot this before
+// submitting so extraction can restrict itself to the new answer's blocks.
+async function countProseBlocks(page) {
+  try {
+    return await page.evaluate(() =>
+      document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
+    );
+  } catch (e) {
+    // Returning 0 silently re-enables the merge-all-previous-turns behaviour this
+    // scoping exists to prevent, so make the degradation visible.
+    log('Warning: could not snapshot prose blocks (' + e.message + '); chat extraction may include earlier turns');
+    return 0;
+  }
+}
+
+async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
   const startTime = Date.now();
   try {
     await page.waitForFunction(() => /perplexity\.ai\/(search|thread|computer)\//.test(window.location.href), { timeout: 15000 }).catch(() => {});
@@ -416,19 +482,32 @@ async function waitForAnswer(page, timeoutMs, flags) {
   // answer into one or more [class*="prose"] blocks; the LAST block is not always
   // the answer (it can be a short trailing/related block), so pick the LONGEST
   // block, which is the full answer body.
-  const extractText = () => page.evaluate(() => {
+  // `blocksBefore` = number of prose/markdown blocks that already existed before
+  // this query was submitted. In an existing chat thread the earlier turns' prose
+  // stays mounted, and picking the longest text would return the PREVIOUS answer
+  // instead of the new one, so restrict the search to blocks after that index.
+  const extractText = (blocksBefore = 0) => page.evaluate((before) => {
     const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
     let best = '';
     for (const sel of selectors) {
-      const els = Array.from(document.querySelectorAll(sel));
+      const all = Array.from(document.querySelectorAll(sel));
+      const els = before > 0 ? all.slice(before) : all;
       for (const el of els) {
         const text = (el && el.innerText) ? el.innerText : '';
         if (text.length > best.length) best = text;
       }
       if (best.length > 5) break;
     }
+    if (!best && before > 0) {
+      // The scoped slice came back empty — the thread's blocks can re-mount or
+      // reorder while an answer streams. Fall back to the newest block instead of
+      // returning nothing.
+      const all = Array.from(document.querySelectorAll('[class*="prose"], [class*="markdown"]'));
+      const last = all[all.length - 1];
+      if (last) best = last.innerText || '';
+    }
     return best;
-  });
+  }, blocksBefore);
 
   // Best-effort hint: is Perplexity still actively streaming the answer? When a
   // "stop generating" control is present we are definitely still streaming. This
@@ -455,11 +534,13 @@ async function waitForAnswer(page, timeoutMs, flags) {
   // polls) but is never required, so a flaky heuristic can't pin us to the full
   // timeout.
   if (isImageGen) {
-    return { text: await extractText(), isImageGen };
+    return { text: await extractText(blocksBefore), isImageGen };
   }
 
-  const STABLE_WITH_HINT = 2;   // stable polls needed when UI confirms not-generating
-  const STABLE_NO_HINT = 5;     // stable polls needed without that confirmation
+  // Chat follow-ups stream like Deep Research, so they need a longer quiet window
+  // than a one-shot answer (review finding: chat was accepted while still partial).
+  const STABLE_WITH_HINT = flags.chat ? 4 : 2;   // stable polls needed when UI confirms not-generating
+  const STABLE_NO_HINT = flags.chat ? 7 : 5;     // stable polls needed without that confirmation
   const POLL_MS = 1500;
   let prev = '';
   let stableCount = 0;
@@ -467,7 +548,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
   while (Date.now() - startTime < timeoutMs) {
     await sleep(POLL_MS);
     let cur = '';
-    try { cur = await extractText(); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
+    try { cur = await extractText(blocksBefore); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
     if (cur.length > best.length) best = cur;
     if (cur.length > 5 && cur === prev) {
       stableCount++;
@@ -483,7 +564,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
 
   // Final read: take the best (longest) text we have observed.
   let finalText = '';
-  try { finalText = await extractText(); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
+  try { finalText = await extractText(blocksBefore); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
   if (finalText.length < best.length) finalText = best;
   return { text: finalText || best || '', isImageGen };
 }
@@ -494,23 +575,76 @@ async function runQuery(flags, query, timeoutMs) {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
 
     if (flags.chat) {
+      // Preferred path: submit the follow-up through the session layer. No
+      // composer, no menu, no stream settling — the thread is addressed by URL.
+      if (flags.thread) {
+        try {
+          const session = require('./session.js');
+          log('chat: submitting through the session layer (no UI)');
+          const asked = await session.submitAsk(query, { threadUrl: flags.thread });
+          if (asked.answer && asked.answer.trim()) {
+            log(`chat: answered via session (${asked.answer.length} chars)`);
+            return {
+              query, answer: asked.answer, mode: 'chat', isImageGeneration: false,
+              generatedImages: [], images: [], sources: [], screenshot: null,
+              url: asked.slug ? `https://www.perplexity.ai/search/${asked.slug}` : flags.thread,
+            };
+          }
+          log('Warning: session ask returned an empty answer; falling back to the UI');
+        } catch (e) {
+          log('Warning: session ask failed (' + e.message + '); falling back to the UI');
+        }
+      }
+
       let perplexityPage = null;
       const pages = await browser.pages();
-      for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
+      if (flags.thread) {
+        // Explicit thread: reuse a tab already on it, otherwise open one, so the
+        // caller does not have to leave the right thread focused by hand.
+        perplexityPage = pages.find((p) => p.url().startsWith(flags.thread)) || null;
+        if (!perplexityPage) {
+          perplexityPage = await browser.newPage();
+          await perplexityPage.goto(flags.thread, { waitUntil: 'domcontentloaded' });
+          await sleep(2000);
+        }
+        await perplexityPage.bringToFront();
+      } else {
+        for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
+      }
       if (!perplexityPage) throw new Error('--chat requires an existing Perplexity search thread. No tab found with a /search/ or /thread/ URL.');
       await perplexityPage.bringToFront();
-      const input = await findFollowUpInput(perplexityPage);
+      const input = await waitForFollowUpInput(perplexityPage);
       if (!input) throw new Error('Could not find follow-up input in existing thread');
+      // Snapshot the block count before submitting so extraction can ignore the
+      // earlier turns already mounted in this thread.
+      const blocksBefore = await countProseBlocks(perplexityPage);
       await typeQuery(perplexityPage, input, query);
       await sleep(500);
       await perplexityPage.keyboard.press('Enter');
-      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags);
+      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags, blocksBefore);
+
+      // Prefer reading the answer back from the thread itself: the thread JSON
+      // carries the finished answer, so the result no longer depends on DOM
+      // extraction at all (only the submission still touches the UI).
+      let finalAnswer = answer;
+      if (!isImageGen) {
+        try {
+          const session = require('./session.js');
+          const read = await session.latestAnswer(perplexityPage.url());
+          if (read.answer && read.answer.trim()) {
+            finalAnswer = read.answer;
+            log(`chat: read answer back from the session (${read.answer.length} chars, ${read.entries} entries)`);
+          }
+        } catch (e) {
+          log('Warning: session read-back failed (' + e.message + '); using the DOM answer');
+        }
+      }
       let generatedImages = [];
       if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
       const ts = Date.now();
       let screenshotPath = null;
       try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
-      return { query, answer: answer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
+      return { query, answer: finalAnswer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
     }
 
     const pages = await browser.pages();
@@ -701,6 +835,30 @@ async function readLibraryMain(page) {
 }
 
 async function runHistory(query, limit) {
+  const oneLineQuery = String(query).replace(/\s*\n+\s*/g, ' ').trim();
+
+  // Session path first: the Library list endpoint answers directly, with none of
+  // the shell-rendering/overlay fragility of scraping the Library UI.
+  try {
+    const session = require('./session.js');
+    const result = await session.searchHistory(oneLineQuery, { limit });
+    // searchHistory resolves to {hits, truncated}; tolerate a bare array too.
+    const hits = Array.isArray(result) ? result
+      : (result && Array.isArray(result.hits) ? result.hits : []);
+    log(`history: session search matched ${hits.length} thread(s)`);
+    return {
+      mode: 'history',
+      query: oneLineQuery,
+      count: hits.length,
+      threads: hits,
+      truncated: Boolean(result && result.truncated),
+      screenshot: null,
+      url: 'https://www.perplexity.ai/library',
+    };
+  } catch (e) {
+    log('Warning: session history search failed (' + e.message + '); falling back to the Library UI');
+  }
+
   let browser;
   try {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });

@@ -291,6 +291,75 @@ ask Perplexity about itself.**
 - Use `--chat` to follow up on a previous query in the same thread
 - Use `--url` to ask Perplexity to analyze a specific webpage
 
+## Session reuse (no UI driving)
+
+The OpenClaw Chrome profile already holds a signed-in Perplexity Pro session.
+`scripts/perplexity-session.mjs` reads its cookies over CDP (including the
+httpOnly session cookies) and pairs the CSRF cookie with an `x-csrf-token`
+header, so internal endpoints can be called without clicking through the UI:
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread https://www.perplexity.ai/search/<slug>
+node scripts/perplexity-session.mjs --json --thread <slug>
+```
+
+Cookies are never printed and never written to disk. This is the least brittle
+layer (no menu selectors, no composer typing, no stream waiting).
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread <url|slug>
+node scripts/perplexity-session.mjs --history "<term>" [--limit N]
+node scripts/perplexity-session.mjs --discover [--limit N]
+node scripts/perplexity-session.mjs --models
+node scripts/perplexity-session.mjs --ask "<question>" [--thread <url>] [--model <id>]
+```
+
+- `--ask` submits through the session layer, so a follow-up needs no composer at
+  all; `--model` picks any id from `--models` (model switching without the UI)
+- `--discover` reads the Discover feed, `--models` lists the account's models
+- `--history` scans the thread list in 200-item pages (the endpoint ignores a
+  search field and the GraphQL API only serves allow-listed operations, so there
+  is no server-side thread search to call)
+
+Fall back to the UI path only for actions that exist nowhere else (Computer mode,
+interactive Discover browsing).
+
+## Deep research via the Agent API (preferred when a key is set)
+
+`--deep` through the browser is fragile (the mode lives in the composer's `/`
+menu and must be picked on an empty composer). When `PERPLEXITY_API_KEY` is
+available, prefer the Agent API instead:
+
+```bash
+node scripts/perplexity-research.mjs --query "..." --preset medium
+node scripts/perplexity-research.mjs --resume <job_id>     # collect a background job
+```
+
+- presets: `fast` (seconds) · `low` · `medium` (default) · `high` · `xhigh`
+- `high`/`xhigh` run as background jobs, polled with backoff; if the run times out
+  the server-side job continues and `--resume <job_id>` collects it
+- **save-and-preview**: the full report goes to `<output-dir>/*.md` + `*.json`;
+  stdout carries only a preview (`--stdout-preview`, default 1500 chars) and the
+  saved paths, so a long report does not flood the agent's context
+- the run prints the API cost it incurred; keep `high`/`xhigh` for real research
+
+## API fallback (search-api.mjs)
+
+When the browser is unavailable, `scripts/search-api.mjs` queries the official
+Perplexity Search API instead:
+
+```bash
+export PERPLEXITY_API_KEY=pplx-...
+node scripts/search-api.mjs "your question" --json
+node scripts/search-api.mjs "q1" "q2" --timeout 90
+```
+
+Each query is sent as its own request (the API expects a single `query` string),
+so batch results keep their per-query label. Requires `PERPLEXITY_API_KEY`;
+without a key the script exits with a clear error rather than an empty result.
+
 ## Troubleshooting
 
 - **"Could not connect to browser"**: Make sure Chrome is running on `:9222`. Check with `curl -s http://127.0.0.1:9222/json/version`.

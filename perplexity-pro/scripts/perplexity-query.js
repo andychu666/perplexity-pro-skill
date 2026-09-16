@@ -377,7 +377,19 @@ async function typeQuery(page, input, query) {
   }
 }
 
-async function waitForAnswer(page, timeoutMs, flags) {
+// Count the prose/markdown blocks currently mounted. Callers snapshot this before
+// submitting so extraction can restrict itself to the new answer's blocks.
+async function countProseBlocks(page) {
+  try {
+    return await page.evaluate(() =>
+      document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
+    );
+  } catch (e) {
+    return 0;
+  }
+}
+
+async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
   const startTime = Date.now();
   try {
     await page.waitForFunction(() => /perplexity\.ai\/(search|thread|computer)\//.test(window.location.href), { timeout: 15000 }).catch(() => {});
@@ -416,11 +428,16 @@ async function waitForAnswer(page, timeoutMs, flags) {
   // answer into one or more [class*="prose"] blocks; the LAST block is not always
   // the answer (it can be a short trailing/related block), so pick the LONGEST
   // block, which is the full answer body.
-  const extractText = () => page.evaluate(() => {
+  // `blocksBefore` = number of prose/markdown blocks that already existed before
+  // this query was submitted. In an existing chat thread the earlier turns' prose
+  // stays mounted, and picking the longest text would return the PREVIOUS answer
+  // instead of the new one, so restrict the search to blocks after that index.
+  const extractText = (blocksBefore = 0) => page.evaluate((before) => {
     const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
     let best = '';
     for (const sel of selectors) {
-      const els = Array.from(document.querySelectorAll(sel));
+      const all = Array.from(document.querySelectorAll(sel));
+      const els = before > 0 ? all.slice(before) : all;
       for (const el of els) {
         const text = (el && el.innerText) ? el.innerText : '';
         if (text.length > best.length) best = text;
@@ -428,7 +445,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
       if (best.length > 5) break;
     }
     return best;
-  });
+  }, blocksBefore);
 
   // Best-effort hint: is Perplexity still actively streaming the answer? When a
   // "stop generating" control is present we are definitely still streaming. This
@@ -455,7 +472,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
   // polls) but is never required, so a flaky heuristic can't pin us to the full
   // timeout.
   if (isImageGen) {
-    return { text: await extractText(), isImageGen };
+    return { text: await extractText(blocksBefore), isImageGen };
   }
 
   const STABLE_WITH_HINT = 2;   // stable polls needed when UI confirms not-generating
@@ -467,7 +484,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
   while (Date.now() - startTime < timeoutMs) {
     await sleep(POLL_MS);
     let cur = '';
-    try { cur = await extractText(); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
+    try { cur = await extractText(blocksBefore); } catch (e) { log('Warning: streaming poll failed: ' + e.message); continue; }
     if (cur.length > best.length) best = cur;
     if (cur.length > 5 && cur === prev) {
       stableCount++;
@@ -483,7 +500,7 @@ async function waitForAnswer(page, timeoutMs, flags) {
 
   // Final read: take the best (longest) text we have observed.
   let finalText = '';
-  try { finalText = await extractText(); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
+  try { finalText = await extractText(blocksBefore); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
   if (finalText.length < best.length) finalText = best;
   return { text: finalText || best || '', isImageGen };
 }
@@ -501,10 +518,13 @@ async function runQuery(flags, query, timeoutMs) {
       await perplexityPage.bringToFront();
       const input = await findFollowUpInput(perplexityPage);
       if (!input) throw new Error('Could not find follow-up input in existing thread');
+      // Snapshot the block count before submitting so extraction can ignore the
+      // earlier turns already mounted in this thread.
+      const blocksBefore = await countProseBlocks(perplexityPage);
       await typeQuery(perplexityPage, input, query);
       await sleep(500);
       await perplexityPage.keyboard.press('Enter');
-      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags);
+      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags, blocksBefore);
       let generatedImages = [];
       if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
       const ts = Date.now();

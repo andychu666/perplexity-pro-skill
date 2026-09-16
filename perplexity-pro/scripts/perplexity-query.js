@@ -52,6 +52,7 @@ Options:
   --brief            Append "Answer briefly in 2-3 sentences"
   --detailed         Append "Provide a detailed, comprehensive answer"
   --chat             Continue in existing Perplexity thread
+  --thread <URL>     Thread to continue (with --chat); opened if no tab matches
   --url <URL>        Prepend a URL for Perplexity to analyze (http/https)
   --deep             Enable Deep Research mode (10 min timeout)
   --computer         Use Computer mode (30 min timeout)
@@ -63,7 +64,7 @@ Options:
   --                 End of options; everything after is treated as query text`;
 
 function parseArgs(argv) {
-  const flags = { brief: false, detailed: false, chat: false, url: null, deep: false, computer: false, discover: null, history: false, limit: 10, help: false };
+  const flags = { brief: false, detailed: false, chat: false, thread: null, url: null, deep: false, computer: false, discover: null, history: false, limit: 10, help: false };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     // `--` ends option parsing: everything after is query text, verbatim.
@@ -74,6 +75,20 @@ function parseArgs(argv) {
       case '--brief': flags.brief = true; break;
       case '--detailed': flags.detailed = true; break;
       case '--chat': flags.chat = true; break;
+      case '--thread': {
+        if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) { console.error('ERROR: --thread requires a URL argument'); process.exit(1); }
+        if (flags.thread !== null) { console.error('ERROR: --thread specified multiple times'); process.exit(1); }
+        const threadUrl = argv[++i];
+        try {
+          const parsed = new URL(threadUrl);
+          if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname.endsWith('perplexity.ai')) {
+            console.error('ERROR: --thread must be a perplexity.ai http(s) URL');
+            process.exit(1);
+          }
+        } catch { console.error('ERROR: --thread value is not a valid URL'); process.exit(1); }
+        flags.thread = threadUrl;
+        break;
+      }
       case '--deep': flags.deep = true; break;
       case '--computer': flags.computer = true; break;
       case '--history':
@@ -521,7 +536,18 @@ async function runQuery(flags, query, timeoutMs) {
     if (flags.chat) {
       let perplexityPage = null;
       const pages = await browser.pages();
-      for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
+      if (flags.thread) {
+        // Explicit thread: reuse a tab already on it, otherwise open one, so the
+        // caller does not have to leave the right thread focused by hand.
+        perplexityPage = pages.find((p) => p.url().startsWith(flags.thread)) || null;
+        if (!perplexityPage) {
+          perplexityPage = await browser.newPage();
+          await perplexityPage.goto(flags.thread, { waitUntil: 'domcontentloaded' });
+          await sleep(3000);
+        }
+      } else {
+        for (const page of pages) { if (page.url().match(/perplexity\.ai\/(search|thread)\//)) { perplexityPage = page; break; } }
+      }
       if (!perplexityPage) throw new Error('--chat requires an existing Perplexity search thread. No tab found with a /search/ or /thread/ URL.');
       await perplexityPage.bringToFront();
       const input = await findFollowUpInput(perplexityPage);

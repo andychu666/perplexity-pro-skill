@@ -24,15 +24,17 @@ const session = require('./session.js');
 function usage() {
   console.log(`Usage: perplexity-session.mjs --whoami
        perplexity-session.mjs [--json] --thread <thread-url-or-slug>
-       perplexity-session.mjs [--json] --ask "<question>" --thread <url>
+       perplexity-session.mjs [--json] --ask "<question>" [--thread <url>] [--model <id>]
        perplexity-session.mjs [--json] --history "<term>" [--limit N]
+       perplexity-session.mjs [--json] --discover [--limit N]
+       perplexity-session.mjs --models
 
 Reuses the logged-in Perplexity session (cookies read over CDP) to query internal
 endpoints without driving the UI. Cookies are never printed.`);
 }
 
 function parseArgs(argv) {
-  const opts = { whoami: false, thread: null, history: null, ask: null, json: false, limit: 10 };
+  const opts = { whoami: false, thread: null, history: null, ask: null, discover: false, models: false, model: null, json: false, limit: 10 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const need = (name) => {
@@ -45,6 +47,9 @@ function parseArgs(argv) {
     else if (a === '--thread') opts.thread = need(a);
     else if (a === '--history' || a === '--library') opts.history = need(a);
     else if (a === '--ask') opts.ask = need(a);
+    else if (a === '--model') opts.model = need(a);
+    else if (a === '--discover') opts.discover = true;
+    else if (a === '--models') opts.models = true;
     else if (a === '--limit') {
       const n = Number(need(a));
       if (!Number.isFinite(n) || n <= 0) { console.error('Error: --limit needs a positive integer'); process.exit(2); }
@@ -52,8 +57,7 @@ function parseArgs(argv) {
     } else if (a === '--help' || a === '-h') { usage(); process.exit(0); }
     else { console.error(`Error: unknown option ${a}`); process.exit(2); }
   }
-  if (!opts.whoami && !opts.thread && !opts.history && !opts.ask) { usage(); process.exit(1); }
-  if (opts.ask && !opts.thread) { console.error('Error: --ask needs --thread <url>'); process.exit(2); }
+  if (!opts.whoami && !opts.thread && !opts.history && !opts.ask && !opts.discover && !opts.models) { usage(); process.exit(1); }
   return opts;
 }
 
@@ -114,7 +118,7 @@ if (opts.thread) {
 if (opts.ask) {
   let result;
   try {
-    result = await session.submitAsk(opts.ask, { threadUrl: opts.thread, cookies });
+    result = await session.submitAsk(opts.ask, { threadUrl: opts.thread, cookies, modelPreference: opts.model });
   } catch (e) {
     console.error(`Error: session ask failed (${e.message})`);
     process.exit(1);
@@ -124,6 +128,45 @@ if (opts.ask) {
   } else {
     console.log(result.answer || '[no answer]');
     if (result.slug) console.log(`\nthread: ${session.ORIGIN}/search/${result.slug}`);
+  }
+}
+
+if (opts.models) {
+  let info;
+  try {
+    info = await session.listModels({ cookies });
+  } catch (e) {
+    console.error(`Error: could not list models (${e.message})`);
+    process.exit(1);
+  }
+  if (opts.json) {
+    console.log(JSON.stringify(info, null, 2));
+  } else {
+    console.log(`models: ${info.models.length}`);
+    for (const m of info.models) {
+      console.log(`  ${String(m.id).padEnd(28)} ${m.label}${m.mode ? `  [${m.mode}]` : ''}`);
+    }
+    if (info.defaults) console.log('defaults:', JSON.stringify(info.defaults));
+  }
+}
+
+if (opts.discover) {
+  let feed;
+  try {
+    feed = await session.discoverFeed({ limit: opts.limit, cookies });
+  } catch (e) {
+    console.error(`Error: discover feed failed (${e.message})`);
+    process.exit(1);
+  }
+  if (opts.json) {
+    console.log(JSON.stringify(feed, null, 2));
+  } else {
+    console.log(`discover: ${feed.items.length} item(s)`);
+    for (const s of feed.items) {
+      console.log(`  - ${s.title}`);
+      if (s.summary) console.log(`    ${s.summary.replace(/\s+/g, ' ').slice(0, 110)}`);
+      if (s.url) console.log(`    ${s.url}`);
+    }
   }
 }
 

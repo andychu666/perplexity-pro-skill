@@ -305,9 +305,26 @@ node scripts/perplexity-session.mjs --json --thread <slug>
 ```
 
 Cookies are never printed and never written to disk. This is the least brittle
-layer (no menu selectors, no composer typing, no stream waiting) — prefer it for
-reading threads and session checks, and fall back to the UI path for actions that
-only exist there (Computer mode, model switching, Discover).
+layer (no menu selectors, no composer typing, no stream waiting).
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread <url|slug>
+node scripts/perplexity-session.mjs --history "<term>" [--limit N]
+node scripts/perplexity-session.mjs --discover [--limit N]
+node scripts/perplexity-session.mjs --models
+node scripts/perplexity-session.mjs --ask "<question>" [--thread <url>] [--model <id>]
+```
+
+- `--ask` submits through the session layer, so a follow-up needs no composer at
+  all; `--model` picks any id from `--models` (model switching without the UI)
+- `--discover` reads the Discover feed, `--models` lists the account's models
+- `--history` scans the thread list in 200-item pages (the endpoint ignores a
+  search field and the GraphQL API only serves allow-listed operations, so there
+  is no server-side thread search to call)
+
+Fall back to the UI path only for actions that exist nowhere else (Computer mode,
+interactive Discover browsing).
 
 ## Deep research via the Agent API (preferred when a key is set)
 

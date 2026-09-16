@@ -104,8 +104,7 @@ function entryAnswer(entry) {
   return '';
 }
 
-async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
-  const jar = cookies || await getCookies();
+async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {  const jar = cookies || await getCookies();
   const { status, body } = await internalFetch('/rest/thread/list_ask_threads', jar, {
     method: 'POST',
     body: JSON.stringify({ limit, offset, source: 'default' }),
@@ -116,10 +115,12 @@ async function listThreads({ cookies, limit = 10, offset = 0 } = {}) {
   return { cookies: jar, threads: body };
 }
 
-async function searchHistory(term, { limit = 10, pages = 3 } = {}) {
+async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}) {
   const jar = await getCookies();
   const needle = String(term || '').toLowerCase().trim();
-  const perPage = 50;
+  // No server-side thread search exists (list_ask_threads ignores a `query`
+  // field, and the GraphQL endpoint only accepts allow-listed operations), so
+  // scan large pages instead: the endpoint serves up to 200 per request.
   const hits = [];
   let skipped = 0;
 
@@ -133,7 +134,7 @@ async function searchHistory(term, { limit = 10, pages = 3 } = {}) {
     }
     if (threads.length === 0) break;
     for (const t of threads) {
-      if (skipped++ >= 200) break;
+      if (skipped++ >= 600) break;
       const haystack = `${t.title || ''} ${t.query_str || ''} ${t.answer_preview || ''}`.toLowerCase();
       if (!needle || haystack.includes(needle)) {
         hits.push({
@@ -259,7 +260,76 @@ async function submitAsk(query, { threadUrl = null, cookies, modelPreference = '
     throw new Error(`perplexity_ask returned HTTP ${res.status}`);
   }
   const parsed = parseAskStream(res.text);
-  return { answer: parsed.answer, slug: parsed.slug || slug, cookies: jar };
+  let answer = parsed.answer;
+  const answerSlug = parsed.slug || slug;
+  if ((!answer || !answer.trim()) && answerSlug) {
+    // The stream sometimes carries only the plan/search blocks; the finished text
+    // then lands on the thread itself, so read it back before giving up.
+    try {
+      const read = await latestAnswer(answerSlug, { cookies: jar });
+      if (read.answer && read.answer.trim()) answer = read.answer;
+    } catch { /* keep the empty answer; the caller can retry */ }
+  }
+  return { answer, slug: answerSlug, cookies: jar };
+}
+
+// --- Discover (no UI) -------------------------------------------------------
+
+function storyFrom(item) {
+  const preview = Array.isArray(item.web_results_preview?.first_urls) ? item.web_results_preview.first_urls[0] : null;
+  return {
+    title: item.title || item.short_title || '(untitled)',
+    summary: item.summary || item.description || null,
+    url: item.url || (item.slug ? `${ORIGIN}/discover/${item.slug}` : preview),
+    source: item.domain_name || null,
+    published: item.published_timestamp || item.updated_datetime || null,
+    item_type: item.item_type || null,
+  };
+}
+
+async function discoverFeed({ limit = 20, offset = 0, cookies } = {}) {
+  const jar = cookies || await getCookies();
+  const { status, body } = await internalFetch(
+    `/rest/discover/feed?limit=${limit}&offset=${offset}&version=2.18&source=default`, jar);
+  if (status !== 200 || !body) throw new Error(`discover feed returned HTTP ${status}`);
+  const items = Array.isArray(body.items) ? body.items : [];
+  return { cookies: jar, items: items.map(storyFrom), nextToken: body.next_token || null };
+}
+
+async function discoverTopics({ cookies } = {}) {
+  const jar = cookies || await getCookies();
+  const { status, body } = await internalFetch('/rest/discover/topics?version=2.18&source=default', jar);
+  if (status !== 200 || !body) throw new Error(`discover topics returned HTTP ${status}`);
+  const all = Array.isArray(body.all_topics) ? body.all_topics : [];
+  const selected = Array.isArray(body.user_selected_topics) ? body.user_selected_topics : [];
+  return {
+    cookies: jar,
+    selected: selected.map((t) => t.topic || t.title || t.key || String(t)),
+    all: all.map((t) => t.topic || t.title || t.key || String(t)),
+  };
+}
+
+// --- Models (no UI) ---------------------------------------------------------
+
+async function listModels({ cookies } = {}) {
+  const jar = cookies || await getCookies();
+  const { status, body } = await internalFetch('/rest/models/config/v2?version=2.18&source=default', jar);
+  if (status !== 200 || !body) throw new Error(`model config returned HTTP ${status}`);
+  const models = body.models || {};
+  const entries = Array.isArray(models)
+    ? models.map((m, i) => ({ id: m.id || m.model || String(i), ...m }))
+    : Object.entries(models).map(([id, m]) => ({ id, ...m }));
+  return {
+    cookies: jar,
+    models: entries.map((m) => ({
+      id: m.id,
+      label: m.label || m.short_name || m.id,
+      description: m.description || null,
+      mode: m.mode || null,
+      provider: m.provider || null,
+    })),
+    defaults: body.default_models || null,
+  };
 }
 
 module.exports = {
@@ -276,4 +346,7 @@ module.exports = {
   latestAnswer,
   submitAsk,
   parseAskStream,
+  discoverFeed,
+  discoverTopics,
+  listModels,
 };

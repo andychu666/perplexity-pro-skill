@@ -19,17 +19,66 @@
 //   --timeout SEC   default 900 for high/xhigh, else 120
 //   --poll-interval SEC  background poll interval (default 10)
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const API_URL = 'https://api.perplexity.ai/v1/agent';
 const PRESETS = ['fast', 'low', 'medium', 'high', 'xhigh'];
 const BACKGROUND_PRESETS = new Set(['high', 'xhigh']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
+// Terminal states that are NOT a successful job. The old code treated every
+// TERMINAL state as done, so a failed job wrote an empty report and exited 0.
+const FAIL_STATES = new Set(['failed', 'cancelled', 'canceled', 'incomplete', 'error', 'expired']);
+const OK_STATES = new Set(['completed', 'success', 'finished', 'succeeded']);
+const JOB_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const REQUEST_TIMEOUT_MS = 120000;
+const RAW_OUTPUT_CAP = 2 * 1048576; // do not copy a multi-MB payload verbatim
 
 function die(code, message, hint) {
   console.error(JSON.stringify({ error: { code, message, hint } }));
   process.exit(1);
+}
+
+// Numeric CLI options used to be parsed with a bare Number(): `--timeout x`
+// became NaN (so the run never timed out) and `--poll-interval x` became 0
+// (a busy loop hammering the API). Validate once, here.
+function argNumber(name, raw, { min = 0 } = {}) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min) {
+    die('ARGUMENT_ERROR', `${name} needs a whole number >= ${min}, got ${JSON.stringify(raw)}`, 'See --help.');
+  }
+  return n;
+}
+
+function jobIdOf(payload, fallback) {
+  return (payload && payload.id) || fallback || 'unknown';
+}
+
+/** Reject a job that ended in a non-success terminal state. Used on the sync
+ *  path, which may legitimately carry no status field at all. */
+function assertNotFailed(payload, fallbackId) {
+  const st = payload && typeof payload.status === 'string' ? payload.status : null;
+  if (st && FAIL_STATES.has(st)) {
+    die('JOB_FAILED', `job ${jobIdOf(payload, fallbackId)} ended as ${st}`,
+      `Inspect it with --resume ${jobIdOf(payload, fallbackId)}`);
+  }
+  return payload;
+}
+
+/** The poll loop only returns on a terminal state, so a terminal state that is
+ *  not a success - or one we do not recognise - must fail loudly rather than
+ *  yield an empty report with exit 0. */
+function assertCompleted(payload, fallbackId) {
+  const st = payload && typeof payload.status === 'string' ? payload.status : null;
+  const id = jobIdOf(payload, fallbackId);
+  if (st && FAIL_STATES.has(st)) {
+    die('JOB_FAILED', `job ${id} ended as ${st}`, `Inspect it with --resume ${id}`);
+  }
+  if (!st || !OK_STATES.has(st)) {
+    die('JOB_STATE', `job ${id} reported ${st === null ? 'no status' : `an unrecognised status: ${st}`}`,
+      `Collect it again with --resume ${id}`);
+  }
+  return payload;
 }
 
 function parseArgs(argv) {
@@ -50,15 +99,20 @@ function parseArgs(argv) {
     else if (a === '--resume') opts.resume = need(a);
     else if (a === '--background') opts.background = true;
     else if (a === '--output-dir') opts.outputDir = need(a);
-    else if (a === '--stdout-preview') opts.stdoutPreview = Number(need(a));
-    else if (a === '--timeout') opts.timeout = Number(need(a));
-    else if (a === '--poll-interval') opts.pollInterval = Number(need(a));
+    else if (a === '--stdout-preview') opts.stdoutPreview = argNumber(a, need(a), { min: 0 });
+    else if (a === '--timeout') opts.timeout = argNumber(a, need(a), { min: 1 });
+    else if (a === '--poll-interval') opts.pollInterval = argNumber(a, need(a), { min: 1 });
     else if (a === '--help' || a === '-h') { usage(); process.exit(0); }
     else die('ARGUMENT_ERROR', `unknown option ${a}`, 'See --help.');
   }
   if (!opts.query && !opts.resume) die('ARGUMENT_ERROR', 'either --query or --resume is required', 'See --help.');
+  if (opts.resume && !JOB_ID.test(opts.resume)) {
+    die('ARGUMENT_ERROR', '--resume must be a job id (letters, digits, . _ : -)', 'See --help.');
+  }
   if (!PRESETS.includes(opts.preset)) die('ARGUMENT_ERROR', `--preset must be one of ${PRESETS.join('|')}`, 'See --help.');
-  if (opts.timeout === null) opts.timeout = BACKGROUND_PRESETS.has(opts.preset) ? 900 : 120;
+  // Collecting an existing background job is the slow path: it needs the long
+  // budget even when the preset text says medium.
+  if (opts.timeout === null) opts.timeout = (opts.resume || BACKGROUND_PRESETS.has(opts.preset)) ? 900 : 120;
   if (opts.background === false && BACKGROUND_PRESETS.has(opts.preset)) opts.background = true;
   return opts;
 }
@@ -80,9 +134,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function request(method, url, body) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 120000);
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       method,
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -91,6 +146,15 @@ async function request(method, url, body) {
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
+  } catch (e) {
+    // A network failure must keep the structured error contract: an unhandled
+    // rejection used to crash the run and lose the resume hint.
+    const why = e && e.name === 'AbortError'
+      ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+      : (e && e.message) || String(e);
+    die('NETWORK_ERROR', `${method} ${url} failed: ${why}`, 'Check connectivity and the API key, then retry.');
+  }
+  try {
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch { /* non-JSON error body */ }
@@ -139,23 +203,25 @@ async function poll(jobId, deadline) {
       die('TIMEOUT', `job ${jobId} did not finish within ${opts.timeout}s`,
         `The server-side job keeps running; collect it with --resume ${jobId}`);
     }
-    const { status, json } = await request('GET', `${API_URL}/${jobId}`);
+    const { status, json } = await request('GET', `${API_URL}/${encodeURIComponent(jobId)}`);
     if (status === 429 || status >= 500) {
       // Rate limited / transient: back off instead of failing the run.
-      await sleep(delay);
+      // Clamp to the remaining budget so --timeout is actually honoured.
+      await sleep(Math.max(0, Math.min(delay, deadline - Date.now())));
       delay = Math.min(delay * 1.5, 30000);
       continue;
     }
     if (status >= 400 || !json) {
       die('API_ERROR', `poll failed with HTTP ${status}`, 'Retry with --resume.');
     }
-    if (TERMINAL.has(json.status)) return json;
+    if (TERMINAL.has(json.status)) return assertCompleted(json, jobId);
     process.stderr.write(`[research] job ${jobId}: ${json.status}\n`);
-    await sleep(delay);
+    await sleep(Math.max(0, Math.min(delay, deadline - Date.now())));
   }
 }
 
 const startedAt = new Date();
+const outDir = resolve(opts.outputDir);
 let payload;
 if (opts.resume) {
   payload = await poll(opts.resume, Date.now() + opts.timeout * 1000);
@@ -167,28 +233,81 @@ if (opts.resume) {
     die('API_ERROR', `Agent API returned HTTP ${status}: ${(text || '').slice(0, 300)}`,
       'Check the API key and preset.');
   }
-  payload = opts.background ? await poll(json.id, Date.now() + opts.timeout * 1000) : json;
+  assertNotFailed(json, null);
+  if (opts.background) {
+    if (!json.id) die('API_ERROR', 'background job started without a job id',
+      'Nothing to collect; re-run the request.');
+    // Persist and announce the id immediately: a job that is only in memory
+    // becomes an orphaned (billed) run the moment this process dies.
+    process.stderr.write(`[research] job ${json.id} started; collect with --resume ${json.id}\n`);
+    try {
+      const dir = outDir;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `.job-${json.id}.json`),
+        JSON.stringify({ job_id: json.id, started_at: startedAt.toISOString(), preset: opts.preset }) + '\n', 'utf8');
+    } catch (e) {
+      process.stderr.write(`[research] could not persist the job id: ${e && e.message}\n`);
+    }
+    payload = await poll(json.id, Date.now() + opts.timeout * 1000);
+  } else {
+    payload = json;
+  }
 }
 
 const report = reportText(payload);
 const jobId = payload.id || opts.resume || null;
+if (!report) {
+  // A finished job with no extractable report means the response shape moved,
+  // not that the answer was empty.
+  die('EMPTY_REPORT', `job ${jobId || 'unknown'} finished without a report`,
+    'The response shape may have changed; inspect the raw payload before relying on this.');
+}
 const elapsed = ((Date.now() - startedAt.getTime()) / 1000).toFixed(1);
 const cost = (payload.usage && payload.usage.cost) || null;
 
-const outDir = resolve(opts.outputDir);
-mkdirSync(outDir, { recursive: true });
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-').slice(0, 19);
-const base = join(outDir, `${slugify(opts.query || jobId)}-${stamp}`);
+
+// Two runs in the same second used to overwrite each other's report (they are
+// billed). Pick the first free name and write through a temp file + rename so a
+// crash cannot leave a half-written result.
+function freeBase(dir, prefix) {
+  for (let n = 0; n < 1000; n++) {
+    const base = join(dir, n === 0 ? prefix : `${prefix}-${n}`);
+    if (!existsSync(`${base}.json`) && !existsSync(`${base}.md`)) return base;
+  }
+  die('OUTPUT_ERROR', 'could not find a free output filename', 'Clean up the output directory.');
+}
+
+function writeAtomic(path, data) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, data, 'utf8');
+  renameSync(tmp, path);
+}
+
+const rawJson = JSON.stringify(payload.output || null);
+const rawOutput = rawJson && rawJson.length > RAW_OUTPUT_CAP
+  ? { truncated: true, bytes: rawJson.length, preview: rawJson.slice(0, RAW_OUTPUT_CAP) }
+  : (payload.output || null);
 const record = {
   query: opts.query, preset: opts.preset, job_id: jobId,
   started_at: startedAt.toISOString(), elapsed_seconds: Number(elapsed),
   report, sources: sources(payload), usage: payload.usage || null,
-  raw_output: payload.output || null,
+  raw_output: rawOutput,
 };
-writeFileSync(`${base}.json`, JSON.stringify(record, null, 2), 'utf8');
-writeFileSync(`${base}.md`,
-  `# ${opts.query || jobId}\n\n_preset: ${opts.preset} · ${elapsed}s · ${jobId || 'n/a'}_\n\n${report}\n`,
-  'utf8');
+
+let base;
+try {
+  mkdirSync(outDir, { recursive: true });
+  base = freeBase(outDir, `${slugify(opts.query || jobId)}-${stamp}`);
+  writeAtomic(`${base}.json`, JSON.stringify(record, null, 2));
+  writeAtomic(`${base}.md`,
+    `# ${opts.query || jobId}\n\n_preset: ${opts.preset} · ${elapsed}s · ${jobId || 'n/a'}_\n\n${report}\n`);
+} catch (e) {
+  // Keep the JSON error contract: an unwritable output directory must not
+  // surface as a raw node stack trace.
+  die('OUTPUT_ERROR', `could not write the report: ${(e && e.message) || e}`,
+    `Check permissions on ${outDir}.`);
+}
 
 const preview = opts.stdoutPreview === 0 ? report : report.slice(0, opts.stdoutPreview);
 console.log(preview);

@@ -444,6 +444,14 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
       }
       if (best.length > 5) break;
     }
+    if (!best && before > 0) {
+      // The scoped slice came back empty — the thread's blocks can re-mount or
+      // reorder while an answer streams. Fall back to the newest block instead of
+      // returning nothing.
+      const all = Array.from(document.querySelectorAll('[class*="prose"], [class*="markdown"]'));
+      const last = all[all.length - 1];
+      if (last) best = last.innerText || '';
+    }
     return best;
   }, blocksBefore);
 

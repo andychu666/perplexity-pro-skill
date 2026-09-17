@@ -421,8 +421,11 @@ async function typeQuery(page, input, query) {
   const tagName = await input.evaluate(el => el.tagName);
   if (tagName === 'TEXTAREA' || tagName === 'INPUT') {
     await input.evaluate((el, text) => {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') ||
-                     Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      // Pick the setter for the element's OWN prototype: reading the textarea
+      // descriptor first made `setter.set.call(inputEl, ...)` throw
+      // "Illegal invocation" on the INPUT composer, so nothing was typed.
+      const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value');
       setter.set.call(el, text);
       el.dispatchEvent(new Event('input', { bubbles: true }));
     }, oneLine);
@@ -672,10 +675,17 @@ async function runQuery(flags, query, timeoutMs) {
       }
       let generatedImages = [];
       if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
-      const ts = Date.now();
+      const ts = Date.now() + '-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
       let screenshotPath = null;
       try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
-      return { query, answer: finalAnswer || '[No answer received]', mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
+      if (!finalAnswer || !finalAnswer.trim()) {
+        // An empty extraction used to be returned as the placeholder string with
+        // exit 0, so a timeout / login wall / block looked like a complete answer
+        // to every caller and cache. Fail loudly instead.
+        throw new Error('No answer extracted for the follow-up — the page may be showing a login wall, '
+          + 'a block, or an empty response. Current URL: ' + perplexityPage.url());
+      }
+      return { query, answer: finalAnswer, mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
     }
 
     const pages = await browser.pages();
@@ -729,7 +739,13 @@ async function runQuery(flags, query, timeoutMs) {
     let screenshotPath = null;
     try { screenshotPath = path.join(OUTPUT_DIR, 'perplexity-result-' + ts + '.png'); await perplexityPage.screenshot({ path: screenshotPath, fullPage: false }); } catch (e) { log('Warning: could not take result screenshot: ' + e.message); }
 
-    return { query, answer: answer || (isImageGen ? '[Image generated - see generatedImages]' : '[No answer received]'), mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url() };
+    if (!answer && !isImageGen) {
+      // Same contract as the chat path: partial/empty must never be presented
+      // as a completed answer with exit 0.
+      throw new Error('No answer extracted — timeout, login wall or empty response. Current URL: '
+        + perplexityPage.url());
+    }
+    return { query, answer: answer || '[Image generated - see generatedImages]', mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url() };
   } finally {
     // Tabs we opened are ours to close: the old code only disconnected, so
     // every run leaked a tab (and its memory) into the long-lived browser.
@@ -786,21 +802,29 @@ async function runDiscover(category, limit) {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
     const pages = await browser.pages();
     let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
+    let openedPage = pages.includes(page) ? null : page;
     await page.bringToFront();
 
     const categories = category === 'all' ? DISCOVER_CATEGORIES : [category];
-    const result = { mode: 'discover', generatedAt: new Date().toISOString(), categories: {} };
+    const result = { mode: 'discover', generatedAt: new Date().toISOString(), categories: {}, errors: {} };
     for (const cat of categories) {
       log('Discover: scraping /' + cat);
       try {
         result.categories[cat] = await scrapeDiscoverCategory(page, cat, limit);
       } catch (e) {
         log('Warning: failed to scrape ' + cat + ': ' + e.message);
+        // Record the failure: a swallowed [] is indistinguishable from
+        // "genuinely no stories" for any caller reading the JSON.
         result.categories[cat] = [];
+        result.errors[cat] = e.message;
       }
+    }
+    if (categories.length && Object.keys(result.errors).length === categories.length) {
+      throw new Error('every discover category failed: ' + Object.values(result.errors).join(' | '));
     }
     return result;
   } finally {
+    if (openedPage) { try { await openedPage.close(); } catch (e) {} }
     if (browser) { try { await browser.disconnect(); } catch (e) {} }
   }
 }
@@ -898,6 +922,7 @@ async function runHistory(query, limit) {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
     const pages = await browser.pages();
     let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
+    let openedPage = pages.includes(page) ? null : page;
     await page.bringToFront();
 
     const oneLine = String(query).replace(/\s*\n+\s*/g, ' ').trim();
@@ -956,12 +981,13 @@ async function runHistory(query, limit) {
       r.url = a ? a.href : null;
     }
 
-    const ts = Date.now();
+    const ts = Date.now() + '-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
     let screenshot = null;
     try { screenshot = path.join(OUTPUT_DIR, 'perplexity-history-' + ts + '.png'); await page.screenshot({ path: screenshot, fullPage: false }); } catch (e) { log('Warning: could not take history screenshot: ' + e.message); }
 
     return { mode: 'history', query: oneLine, count: Math.min(rows.length, limit), threads: rows.slice(0, limit), screenshot, url: page.url() };
   } finally {
+    if (openedPage) { try { await openedPage.close(); } catch (e) {} }
     if (browser) { try { await browser.disconnect(); } catch (e) {} }
   }
 }

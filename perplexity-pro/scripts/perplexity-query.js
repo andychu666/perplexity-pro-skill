@@ -619,9 +619,12 @@ async function runQuery(flags, query, timeoutMs) {
       // Preferred path: submit the follow-up through the session layer. No
       // composer, no menu, no stream settling — the thread is addressed by URL.
       if (flags.thread) {
+        let session = null;
+        let submitted = false;
         try {
-          const session = require('./session.js');
+          session = require('./session.js');
           log('chat: submitting through the session layer (no UI)');
+          submitted = true;
           const asked = await session.submitAsk(query, { threadUrl: flags.thread });
           if (asked.answer && asked.answer.trim()) {
             log(`chat: answered via session (${asked.answer.length} chars)`);
@@ -631,9 +634,38 @@ async function runQuery(flags, query, timeoutMs) {
               url: asked.slug ? `https://www.perplexity.ai/search/${asked.slug}` : flags.thread,
             };
           }
-          log('Warning: session ask returned an empty answer; falling back to the UI');
+          log('Warning: session ask returned an empty answer; retrying the read-back');
         } catch (e) {
-          log('Warning: session ask failed (' + e.message + '); falling back to the UI');
+          log('Warning: session ask failed (' + e.message + '); retrying the read-back');
+        }
+        if (submitted) {
+          // The follow-up may already have been POSTed, so the UI path would ask
+          // the same question a second time. Poll the thread for the answer
+          // instead, then fail loudly — never re-submit through the UI.
+          const readbackAttempts = 6;
+          const readbackGapMs = 5000;
+          let answer = '';
+          let slug = null;
+          let lastError = null;
+          for (let attempt = 0; attempt < readbackAttempts && !answer; attempt++) {
+            if (attempt > 0) await sleep(readbackGapMs);
+            try {
+              const read = await session.latestAnswer(flags.thread);
+              if (read.answer && read.answer.trim()) { answer = read.answer; slug = read.slug; }
+            } catch (e) { lastError = e; }
+          }
+          if (!answer || !answer.trim()) {
+            throw new Error('chat: the follow-up was submitted through the session layer but no answer could be read back from the thread'
+              + ' after ' + readbackAttempts + ' attempts'
+              + (lastError ? ' (' + lastError.message + ')' : '')
+              + '; refusing to re-submit it through the UI. Thread: ' + flags.thread);
+          }
+          log(`chat: answered via session (${answer.length} chars)`);
+          return {
+            query, answer, mode: 'chat', isImageGeneration: false,
+            generatedImages: [], images: [], sources: [], screenshot: null,
+            url: slug ? `https://www.perplexity.ai/search/${slug}` : flags.thread,
+          };
         }
       }
 
@@ -806,11 +838,14 @@ async function scrapeDiscoverCategory(page, category, limit) {
 
 async function runDiscover(category, limit) {
   let browser;
+  let openedPage = null;
   try {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
     const pages = await browser.pages();
-    let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
-    let openedPage = pages.includes(page) ? null : page;
+    // Reuse only a tab already on the Discover feed: navigating any other
+    // Perplexity tab the user has open would destroy their state.
+    let page = pages.find(p => p.url().startsWith('https://www.perplexity.ai/discover/'));
+    if (!page) { page = await browser.newPage(); openedPage = page; }
     await page.bringToFront();
 
     const categories = category === 'all' ? DISCOVER_CATEGORIES : [category];
@@ -926,11 +961,14 @@ async function runHistory(query, limit) {
   }
 
   let browser;
+  let openedPage = null;
   try {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
     const pages = await browser.pages();
-    let page = pages.find(p => p.url().includes('perplexity.ai')) || await browser.newPage();
-    let openedPage = pages.includes(page) ? null : page;
+    // Reuse only a tab already in the Library: navigating any other Perplexity
+    // tab the user has open would destroy their state.
+    let page = pages.find(p => p.url().startsWith('https://www.perplexity.ai/library'));
+    if (!page) { page = await browser.newPage(); openedPage = page; }
     await page.bringToFront();
 
     const oneLine = String(query).replace(/\s*\n+\s*/g, ' ').trim();

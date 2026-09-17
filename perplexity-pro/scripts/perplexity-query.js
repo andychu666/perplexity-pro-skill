@@ -2,7 +2,8 @@
 /**
  * perplexity-query.js - Query Perplexity Pro via Chrome CDP (pi-adapted)
  *
- * Uses puppeteer-core instead of playwright-core, connects to pi's Chrome on :9222.
+ * Uses puppeteer-core instead of playwright-core, connects to the OpenClaw-managed Chrome (CDP on :18800 by default;
+ * override with PERPLEXITY_CDP).
  *
  * Usage: node perplexity-query.js [flags] "your question here"
  */
@@ -147,7 +148,10 @@ function validateFlags(flags) {
   if (flags.computer && flags.brief) { console.error('ERROR: --brief is not compatible with --computer mode'); process.exit(1); }
 }
 
-const CDP_URL = 'http://127.0.0.1:9222';
+// One browser for both paths: the OpenClaw-managed Chrome (18800), the same
+// default session-core.js uses, so the UI path and the internal-API path drive
+// one profile and one login. PERPLEXITY_CDP overrides it.
+const CDP_URL = process.env.PERPLEXITY_CDP || 'http://127.0.0.1:18800';
 const OUTPUT_DIR = process.env.PERPLEXITY_OUTPUT_DIR || '/tmp';
 const MAX_RETRIES = (() => { const v = parseInt(process.env.PERPLEXITY_RETRIES, 10); return Number.isFinite(v) && v >= 0 ? v : 2; })();
 
@@ -475,17 +479,21 @@ async function countProseBlocks(page) {
 
 async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
   const startTime = Date.now();
+    // Every warm-up wait is bounded by the REMAINING budget: the flat 5s plus up
+    // to 12 x 3s below ignored --timeout entirely, so a short timeout was blown
+    // before extraction even started.
+    const remaining = () => Math.max(0, timeoutMs - (Date.now() - startTime));
   try {
-    await page.waitForFunction(() => /perplexity\.ai\/(search|thread|computer)\//.test(window.location.href), { timeout: 15000 }).catch(() => {});
+    await page.waitForFunction(() => /perplexity\.ai\/(search|thread|computer)\//.test(window.location.href), { timeout: Math.min(15000, Math.max(1000, remaining())) }).catch(() => {});
   } catch (e) {}
 
-  await sleep(5000);
+  await sleep(Math.min(5000, remaining()));
   let isImageGen = false;
   try { isImageGen = await detectImageGeneration(page); } catch (e) { log('Warning: image detection failed: ' + e.message); }
 
   if (!isImageGen) {
-    for (let i = 0; i < 12; i++) {
-      await sleep(3000);
+    for (let i = 0; i < 12 && remaining() > 0; i++) {
+        await sleep(Math.min(3000, remaining()));
       try { isImageGen = await detectImageGeneration(page); } catch (e) { log('Warning: image detection poll failed: ' + e.message); }
       if (isImageGen) break;
       try {
@@ -708,7 +716,7 @@ async function runQuery(flags, query, timeoutMs) {
 
     const input = await findInput(perplexityPage);
     if (!input) {
-      try { const debugPath = path.join(OUTPUT_DIR, 'perplexity-debug-' + Date.now() + '.png'); await perplexityPage.screenshot({ path: debugPath }); log('Debug screenshot: ' + debugPath); } catch (e) { log('Warning: debug screenshot also failed: ' + e.message); }
+      try { const debugPath = path.join(OUTPUT_DIR, 'perplexity-debug-' + Date.now() + '-' + process.pid + '.png'); await perplexityPage.screenshot({ path: debugPath }); log('Debug screenshot: ' + debugPath); } catch (e) { log('Warning: debug screenshot also failed: ' + e.message); }
       throw new Error('Could not find Perplexity search input');
     }
 
@@ -983,7 +991,7 @@ async function runHistory(query, limit) {
 
     const ts = Date.now() + '-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
     let screenshot = null;
-    try { screenshot = path.join(OUTPUT_DIR, 'perplexity-history-' + ts + '.png'); await page.screenshot({ path: screenshot, fullPage: false }); } catch (e) { log('Warning: could not take history screenshot: ' + e.message); }
+    try { screenshot = path.join(OUTPUT_DIR, 'perplexity-history-' + ts + '-' + process.pid + '-' + Math.random().toString(36).slice(2,8) + '.png'); await page.screenshot({ path: screenshot, fullPage: false }); } catch (e) { log('Warning: could not take history screenshot: ' + e.message); }
 
     return { mode: 'history', query: oneLine, count: Math.min(rows.length, limit), threads: rows.slice(0, limit), screenshot, url: page.url() };
   } finally {

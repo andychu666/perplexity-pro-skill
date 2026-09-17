@@ -136,29 +136,34 @@ if (!apiKey) die('NO_API_KEY', 'PERPLEXITY_API_KEY environment variable not set'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function request(method, url, body) {
+// `returnTransportError` is the poll loop's opt-in escape hatch: a momentary
+// transport failure while polling a long-running, already-billed server-side job
+// must not kill this process. Every other caller keeps the die-on-failure path.
+async function request(method, url, body, { returnTransportError = false } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let res;
   try {
-    res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-  } catch (e) {
-    // A network failure must keep the structured error contract: an unhandled
-    // rejection used to crash the run and lose the resume hint.
-    const why = e && e.name === 'AbortError'
-      ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-      : (e && e.message) || String(e);
-    die('NETWORK_ERROR', `${method} ${url} failed: ${why}`, 'Check connectivity and the API key, then retry.');
-  }
-  try {
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      // A network failure must keep the structured error contract: an unhandled
+      // rejection used to crash the run and lose the resume hint.
+      const why = e && e.name === 'AbortError'
+        ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+        : (e && e.message) || String(e);
+      const err = { code: 'NETWORK_ERROR', message: `${method} ${url} failed: ${why}` };
+      if (returnTransportError) return { transportError: err };
+      die(err.code, err.message, 'Check connectivity and the API key, then retry.');
+    }
     let text;
     try {
       text = await res.text();
@@ -169,7 +174,9 @@ async function request(method, url, body) {
       const why = e && e.name === 'AbortError'
         ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
         : (e && e.message) || String(e);
-      die('NETWORK_ERROR', `${method} ${url} body read failed: ${why}`, 'Check connectivity and retry.');
+      const err = { code: 'NETWORK_ERROR', message: `${method} ${url} body read failed: ${why}` };
+      if (returnTransportError) return { transportError: err };
+      die(err.code, err.message, 'Check connectivity and retry.');
     }
     let json = null;
     try { json = JSON.parse(text); } catch { /* non-JSON error body */ }
@@ -217,13 +224,34 @@ function slugify(text) {
 }
 
 async function poll(jobId, deadline) {
+  const url = `${API_URL}/${encodeURIComponent(jobId)}`;
   let delay = Math.max(2, opts.pollInterval) * 1000;
+  let lastTransportError = null;
   for (;;) {
     if (Date.now() > deadline) {
+      // A transport failure is not proof the job died: it is still running
+      // server-side. Name the last one so the caller sees the real cause, and
+      // keep the resume hint that tells them how to collect the billed job.
+      if (lastTransportError) {
+        die(lastTransportError.code,
+          `job ${jobId} is still running, but polling kept failing at the transport layer until the ${opts.timeout}s deadline (last: ${lastTransportError.message})`,
+          `The server-side job keeps running; collect it with --resume ${jobId}`);
+      }
       die('TIMEOUT', `job ${jobId} did not finish within ${opts.timeout}s`,
         `The server-side job keeps running; collect it with --resume ${jobId}`);
     }
-    const { status, json } = await request('GET', `${API_URL}/${encodeURIComponent(jobId)}`);
+    const { status, json, transportError } = await request('GET', url, undefined, { returnTransportError: true });
+    if (transportError) {
+      // ECONNRESET / ETIMEDOUT / socket hang up / transient DNS: retry with the
+      // same backoff as 429/5xx rather than terminating a poll loop for a job
+      // that is still running and billed.
+      lastTransportError = transportError;
+      process.stderr.write(`[research] job ${jobId}: ${transportError.message}; retrying\n`);
+      await sleep(Math.max(0, Math.min(delay, deadline - Date.now())));
+      delay = Math.min(delay * 1.5, 30000);
+      continue;
+    }
+    lastTransportError = null;
     if (status === 429 || status >= 500) {
       // Rate limited / transient: back off instead of failing the run.
       // Clamp to the remaining budget so --timeout is actually honoured.

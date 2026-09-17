@@ -1,23 +1,28 @@
 ---
 name: perplexity-pro
 description: >
-  Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation (pi-adapted).
+  Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation on the OpenClaw-managed browser.
   Use when (1) deep research with web citations needed, (2) questions where web_search
   is insufficient, (3) image generation requests, (4) complex multi-step research queries,
   (5) analyzing a specific URL, (6) continuing a conversation thread, (7) computer/tool-use tasks.
   (8) browsing the Discover news feed by category, (9) searching your own past
   threads (Library history) for prior research on a topic.
   Flags: --brief, --detailed, --chat, --url, --deep, --computer, --discover, --history.
-  Uses pi-managed Chrome browser (port 9222).
+  Uses the OpenClaw-managed Chrome browser (CDP on :18800).
 ---
 
-# Perplexity Pro (pi-adapted)
+# Perplexity Pro (OpenClaw)
 
-Query Perplexity Pro via Chrome CDP browser automation using pi's Chrome instance on port 9222.
+Query Perplexity Pro via Chrome CDP browser automation using the OpenClaw-managed Chrome instance (CDP on :18800).
+
+## Scope & verification status
+
+**Verified end to end with OpenClaw only.** The scripts are plain Node + `puppeteer-core`,
+but no other harness has been exercised against this skill, so no other harness is claimed.
 
 ## Prerequisites
 
-- Chrome running with remote debugging on `:9222`
+- The OpenClaw-managed Chrome running with CDP on `:18800` (`PERPLEXITY_CDP` overrides)
 - Logged into Perplexity Pro account in Chrome (see [Login](#login-do-this-once-before-your-first-query))
 - `puppeteer-core` available
 
@@ -29,7 +34,7 @@ Run once before first use:
 cd {baseDir} && npm install
 ```
 
-If you already have the [browser-tools](https://github.com/badlogic/pi-skills/tree/main/browser-tools)
+If a `puppeteer-core` install already exists on this host, the scripts reuse it (auto-detected).
 skill installed, the script will reuse its `puppeteer-core` automatically and you can skip `npm install`.
 
 ## Tests
@@ -43,54 +48,40 @@ cd {baseDir} && npm test
 
 ## Quick Start
 
-Start Chrome (if not running):
-```bash
-# Start headless Chrome
-mkdir -p ~/.cache/browser-tools
-google-chrome-stable \
-  --remote-debugging-port=9222 \
-  --user-data-dir=~/.cache/browser-tools \
-  --no-first-run --no-default-browser-check \
-  --no-sandbox --headless \
-  2>/dev/null &
+The skill drives the **OpenClaw-managed Chrome** over CDP at `http://127.0.0.1:18800`
+— the browser OpenClaw itself manages. Do not hand-launch a second Chrome for this
+skill: one profile means one login, shared by the UI path and the session/API path.
 
-# Or with a visible display for login
-# Omit --headless if you have X11/DISPLAY setup
+```bash
+# Confirm the managed browser is up
+curl -s http://127.0.0.1:18800/json/version
+```
+
+To use a different browser, point the skill at it instead of editing the code:
+
+```bash
+export PERPLEXITY_CDP=http://127.0.0.1:<port>
 ```
 
 ## Login (do this once, before your first query)
 
-Perplexity Pro answers require a logged-in session. **The login lives in the Chrome
-profile on disk** (`~/.cache/browser-tools`), not in the running process — so you
-log in once in a *visible* window and every later *headless* run reuses that
-session automatically.
+Perplexity Pro answers require a signed-in session. The login lives in the browser
+**profile on disk** (`~/.openclaw/browser/openclaw/user-data`), not in the running
+process, so you sign in once and later runs reuse it.
 
-> ⚠️ One profile can only be opened by one Chrome at a time (a `SingletonLock` in
-> the profile dir enforces this). Stop any headless Chrome on `:9222` before
-> launching a visible one on the same `--user-data-dir`.
+1. Sign in to Perplexity in the **OpenClaw-managed browser** (open it from the
+   Control UI or with the `browser` tool; use a non-headless session if you need a
+   visible window to complete the login).
+2. Verify the session the skill will actually see:
 
-1. Stop any headless instance using the profile:
-   ```bash
-   pkill -f 'remote-debugging-port=9222'
-   ```
-2. Launch a **visible** Chrome on the same profile (needs a desktop / X display —
-   note the **omitted** `--headless`):
-   ```bash
-   google-chrome-stable --remote-debugging-port=9222 \
-     --user-data-dir=~/.cache/browser-tools \
-     --no-first-run --no-default-browser-check
-   ```
-3. In that window go to <https://www.perplexity.ai>, sign in (Google SSO / email /
-   magic link — whatever your Pro account uses), and confirm your account shows as
-   logged in.
-4. Close the window, then relaunch **headless** (the Quick Start command above).
-   The session persists on disk; queries now run authenticated.
+```bash
+node scripts/perplexity-session.mjs --whoami
+```
 
-You only repeat this when the session eventually expires — symptom: logged-out or
-Pro-gated answers (see the *Not logged in* item under [Troubleshooting](#troubleshooting)).
-Don't try to log in *through* headless automation: Google SSO / magic-link flows
-fight bot input (captcha, device checks). The visible-login → headless-reuse
-pattern sidesteps all of it.
+A usable session prints `session: OK ... csrf: present`. **Cookies alone are not
+enough**: without `next-auth.csrf-token` (`csrf: missing`) the internal endpoints
+reject the call — sign in again in *that* profile, or point `PERPLEXITY_CDP` at the
+profile that has it.
 
 ## Quick Query
 
@@ -242,11 +233,10 @@ For image generation queries, `isImageGeneration` is `true` and images are auto-
 
 ## Differences from the OpenClaw Original
 
-This is a port of an earlier Perplexity Pro skill (built for OpenClaw) to the pi / Claude Code skill format:
 
 - Uses `puppeteer-core` instead of `playwright-core` (resolved from this skill's `node_modules`, or reused from the browser-tools skill)
-- Connects to Chrome at `http://127.0.0.1:9222` instead of `:18800`
-- No OpenClaw dependency
+- Connects to the OpenClaw-managed Chrome at `http://127.0.0.1:18800` (`PERPLEXITY_CDP` overrides)
+- One browser profile for both paths: the UI automation and the session/API layer share the OpenClaw-managed login
 - Headless-friendly: Chrome started with `--headless` works (log into Perplexity at least once interactively first)
 - Deep Research toggle rewritten for Perplexity's current Radix dropdown UI
 
@@ -362,7 +352,7 @@ without a key the script exits with a clear error rather than an empty result.
 
 ## Troubleshooting
 
-- **"Could not connect to browser"**: Make sure Chrome is running on `:9222`. Check with `curl -s http://127.0.0.1:9222/json/version`.
+- **"Could not connect to browser"**: Make sure Chrome is running on `:18800`. Check with `curl -s http://127.0.0.1:18800/json/version`.
 - **"Could not find search input"**: Perplexity UI may have changed; check debug screenshot at `/tmp/perplexity-debug-*.png`.
 - **Timeout with no answer**: Answer rendered but extraction failed; check result screenshot.
 - **Not logged in**: You must log into Perplexity at least once. If running headless, start Chrome without `--headless` first, log in, then restart with `--headless` (the profile persists).

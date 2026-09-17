@@ -1,7 +1,7 @@
 ---
 name: perplexity-pro
 description: >
-  Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation (pi-adapted).
+  Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation on the OpenClaw-managed browser.
   Use when (1) deep research with web citations needed, (2) questions where web_search
   is insufficient, (3) image generation requests, (4) complex multi-step research queries,
   (5) analyzing a specific URL, (6) continuing a conversation thread, (7) computer/tool-use tasks.
@@ -11,17 +11,14 @@ description: >
   Uses the OpenClaw-managed Chrome browser (CDP on :18800).
 ---
 
-# Perplexity Pro (pi-adapted)
+# Perplexity Pro (OpenClaw)
 
 Query Perplexity Pro via Chrome CDP browser automation using the OpenClaw-managed Chrome instance (CDP on :18800).
 
 ## Scope & verification status
 
-**End-to-end verified with OpenClaw only** (session reuse over CDP, `--whoami`,
-history, discover, models, ask). The scripts are plain Node + `puppeteer-core` and the
-folder follows the portable `SKILL.md` layout, so another harness may load it - but the
-pi / Claude Code / Codex CLI / Amp / Droid paths are **untested**. Please do not describe
-them as supported until someone runs them and reports back.
+**Verified end to end with OpenClaw only.** The scripts are plain Node + `puppeteer-core`,
+but no other harness has been exercised against this skill, so no other harness is claimed.
 
 ## Prerequisites
 
@@ -37,7 +34,7 @@ Run once before first use:
 cd {baseDir} && npm install
 ```
 
-If you already have the [browser-tools](https://github.com/badlogic/pi-skills/tree/main/browser-tools)
+If a `puppeteer-core` install already exists on this host, the scripts reuse it (auto-detected).
 skill installed, the script will reuse its `puppeteer-core` automatically and you can skip `npm install`.
 
 ## Tests
@@ -236,7 +233,6 @@ For image generation queries, `isImageGeneration` is `true` and images are auto-
 
 ## Differences from the OpenClaw Original
 
-This is a port of an earlier Perplexity Pro skill (built for OpenClaw) to the pi / Claude Code skill format:
 
 - Uses `puppeteer-core` instead of `playwright-core` (resolved from this skill's `node_modules`, or reused from the browser-tools skill)
 - Connects to the OpenClaw-managed Chrome at `http://127.0.0.1:18800` (`PERPLEXITY_CDP` overrides)

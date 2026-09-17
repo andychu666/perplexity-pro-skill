@@ -465,16 +465,13 @@ async function typeQuery(page, input, query) {
 // Count the prose/markdown blocks currently mounted. Callers snapshot this before
 // submitting so extraction can restrict itself to the new answer's blocks.
 async function countProseBlocks(page) {
-  try {
-    return await page.evaluate(() =>
-      document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
-    );
-  } catch (e) {
-    // Returning 0 silently re-enables the merge-all-previous-turns behaviour this
-    // scoping exists to prevent, so make the degradation visible.
-    log('Warning: could not snapshot prose blocks (' + e.message + '); chat extraction may include earlier turns');
-    return 0;
-  }
+  // Throws when the snapshot fails: returning 0 would silently disable the
+  // pre-submit scoping and let the previous turn's prose be extracted as the new
+  // answer. Only the chat path calls this, so a failed snapshot fails loudly
+  // there instead of degrading into the leak this scoping exists to prevent.
+  return await page.evaluate(() =>
+    document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
+  );
 }
 
 async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
@@ -536,14 +533,10 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
       }
       if (best.length > 5) break;
     }
-    if (!best && before > 0) {
-      // The scoped slice came back empty — the thread's blocks can re-mount or
-      // reorder while an answer streams. Fall back to the newest block instead of
-      // returning nothing.
-      const all = Array.from(document.querySelectorAll('[class*="prose"], [class*="markdown"]'));
-      const last = all[all.length - 1];
-      if (last) best = last.innerText || '';
-    }
+    // A scoped slice (before > 0) that came back empty means the thread's blocks
+    // are re-mounting: return nothing so the caller keeps polling and its
+    // "no answer extracted" check fails loudly. Falling back to the newest
+    // mounted block would silently return the PREVIOUS turn's answer.
     return best;
   }, blocksBefore);
 
@@ -621,8 +614,17 @@ async function runQuery(flags, query, timeoutMs) {
       if (flags.thread) {
         let session = null;
         let submitted = false;
+        // Entry count before submitting: an unchanged count after a failed
+        // submit proves no POST landed, so the UI fallback is safe to use.
+        let entriesBefore = null;
         try {
           session = require('./session.js');
+          try {
+            const snapshot = await session.latestAnswer(flags.thread);
+            if (snapshot && Number.isFinite(snapshot.entries)) entriesBefore = snapshot.entries;
+          } catch (e) {
+            log('Warning: could not snapshot the thread entry count (' + e.message + '); the UI fallback will be unavailable if the submit does not land');
+          }
           log('chat: submitting through the session layer (no UI)');
           submitted = true;
           const asked = await session.submitAsk(query, { threadUrl: flags.thread });
@@ -654,18 +656,33 @@ async function runQuery(flags, query, timeoutMs) {
               if (read.answer && read.answer.trim()) { answer = read.answer; slug = read.slug; }
             } catch (e) { lastError = e; }
           }
-          if (!answer || !answer.trim()) {
+          if (answer && answer.trim()) {
+            log(`chat: answered via session (${answer.length} chars)`);
+            return {
+              query, answer, mode: 'chat', isImageGeneration: false,
+              generatedImages: [], images: [], sources: [], screenshot: null,
+              url: slug ? `https://www.perplexity.ai/search/${slug}` : flags.thread,
+            };
+          }
+          // No answer. An entry count identical to the pre-submit snapshot proves
+          // the submit never POSTed (e.g. the session layer rejected the URL), so
+          // the question can safely be asked through the UI instead. If the thread
+          // grew — or the counts cannot be compared — the POST may have landed:
+          // fail loudly and never re-submit.
+          let gainedEntry = true;
+          if (entriesBefore !== null) {
+            try {
+              const now = await session.latestAnswer(flags.thread);
+              gainedEntry = !(now && Number.isFinite(now.entries) && now.entries === entriesBefore);
+            } catch (e) { lastError = lastError || e; }
+          }
+          if (gainedEntry) {
             throw new Error('chat: the follow-up was submitted through the session layer but no answer could be read back from the thread'
               + ' after ' + readbackAttempts + ' attempts'
               + (lastError ? ' (' + lastError.message + ')' : '')
               + '; refusing to re-submit it through the UI. Thread: ' + flags.thread);
           }
-          log(`chat: answered via session (${answer.length} chars)`);
-          return {
-            query, answer, mode: 'chat', isImageGeneration: false,
-            generatedImages: [], images: [], sources: [], screenshot: null,
-            url: slug ? `https://www.perplexity.ai/search/${slug}` : flags.thread,
-          };
+          log('chat: the session submit added no thread entry; falling back to the UI');
         }
       }
 
@@ -729,7 +746,11 @@ async function runQuery(flags, query, timeoutMs) {
     }
 
     const pages = await browser.pages();
-    let perplexityPage = pages.find(p => { const url = p.url(); return url.includes('perplexity.ai') && !url.includes('count.perplexity') && !url.includes('service-worker') && !url.startsWith('blob:'); });
+    // Reuse a tab only when it is already exactly on the target page: navigating
+    // any other Perplexity tab (an unsent draft, a thread the user is reading)
+    // would destroy their state.
+    const targetUrl = flags.computer ? 'https://www.perplexity.ai/computer/new' : 'https://www.perplexity.ai/';
+    let perplexityPage = pages.find(p => p.url() === targetUrl) || null;
     if (!perplexityPage) { perplexityPage = await browser.newPage(); openedPage = perplexityPage; }
     await perplexityPage.bringToFront();
 
@@ -840,7 +861,9 @@ async function runDiscover(category, limit) {
   let browser;
   let openedPage = null;
   try {
-    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
+    // protocolTimeout: without it a wedged CDP socket makes every call hang
+    // forever instead of failing.
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null, protocolTimeout: 60000 });
     const pages = await browser.pages();
     // Reuse only a tab already on the Discover feed: navigating any other
     // Perplexity tab the user has open would destroy their state.
@@ -963,7 +986,9 @@ async function runHistory(query, limit) {
   let browser;
   let openedPage = null;
   try {
-    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
+    // protocolTimeout: without it a wedged CDP socket makes every call hang
+    // forever instead of failing.
+    browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null, protocolTimeout: 60000 });
     const pages = await browser.pages();
     // Reuse only a tab already in the Library: navigating any other Perplexity
     // tab the user has open would destroy their state.

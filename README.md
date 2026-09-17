@@ -1,4 +1,4 @@
-# perplexity-pro-skill
+# perplexity-skill-for-openclaw
 
 An **OpenClaw** skill for querying **Perplexity Pro** through Chrome DevTools Protocol
 automation — grounded AI answers with citations, Deep Research, URL analysis, image
@@ -16,20 +16,24 @@ the front matter still reads "pi-adapted" — the OpenClaw wiring is the tested 
 
 ## Installation
 
+The OpenClaw path is the verified one. The layouts below follow the portable
+`SKILL.md` conventions and have **not** been exercised end to end — treat them as
+untested starting points, not as supported installs.
+
 ### pi-coding-agent
 
 ```bash
 # User-level (available in all projects)
-git clone https://github.com/andychu666/perplexity-pro-skill ~/.pi/agent/skills/perplexity-pro-skill
+git clone https://github.com/andychu666/perplexity-skill-for-openclaw ~/.pi/agent/skills/perplexity-skill-for-openclaw
 
 # Or project-level
-git clone https://github.com/andychu666/perplexity-pro-skill .pi/skills/perplexity-pro-skill
+git clone https://github.com/andychu666/perplexity-skill-for-openclaw .pi/skills/perplexity-skill-for-openclaw
 ```
 
 ### Codex CLI
 
 ```bash
-git clone https://github.com/andychu666/perplexity-pro-skill ~/.codex/skills/perplexity-pro-skill
+git clone https://github.com/andychu666/perplexity-skill-for-openclaw ~/.codex/skills/perplexity-skill-for-openclaw
 ```
 
 ### Claude Code
@@ -37,9 +41,9 @@ git clone https://github.com/andychu666/perplexity-pro-skill ~/.codex/skills/per
 Claude Code only looks one level deep for `SKILL.md`, so symlink the skill folder:
 
 ```bash
-git clone https://github.com/andychu666/perplexity-pro-skill ~/perplexity-pro-skill
+git clone https://github.com/andychu666/perplexity-skill-for-openclaw ~/perplexity-skill-for-openclaw
 mkdir -p ~/.claude/skills
-ln -s ~/perplexity-pro-skill/perplexity-pro ~/.claude/skills/perplexity-pro
+ln -s ~/perplexity-skill-for-openclaw/perplexity-pro ~/.claude/skills/perplexity-pro
 ```
 
 ## Available Skills

@@ -15,6 +15,14 @@ description: >
 
 Query Perplexity Pro via Chrome CDP browser automation using the OpenClaw-managed Chrome instance (CDP on :18800).
 
+## Scope & verification status
+
+**End-to-end verified with OpenClaw only** (session reuse over CDP, `--whoami`,
+history, discover, models, ask). The scripts are plain Node + `puppeteer-core` and the
+folder follows the portable `SKILL.md` layout, so another harness may load it - but the
+pi / Claude Code / Codex CLI / Amp / Droid paths are **untested**. Please do not describe
+them as supported until someone runs them and reports back.
+
 ## Prerequisites
 
 - The OpenClaw-managed Chrome running with CDP on `:18800` (`PERPLEXITY_CDP` overrides)

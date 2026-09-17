@@ -1,15 +1,18 @@
 # perplexity-pro-skill
 
-A [pi-coding-agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) skill
-for querying **Perplexity Pro** through Chrome DevTools Protocol automation — grounded AI answers
-with citations, Deep Research, URL analysis, image generation, conversation threads,
-and search over your own thread history (Library).
+An **OpenClaw** skill for querying **Perplexity Pro** through Chrome DevTools Protocol
+automation — grounded AI answers with citations, Deep Research, URL analysis, image
+generation, conversation threads, and search over your own thread history (Library).
 
-Compatible with pi, Claude Code, Codex CLI, Amp, and Droid.
+**Verified end-to-end only with OpenClaw.** The scripts are plain Node + `puppeteer-core`
+and the folder follows the portable `SKILL.md` layout, so another harness may well load
+it — but only the OpenClaw path has actually been exercised end to end (session reuse over
+CDP, `--whoami`, history, discover, models, ask). Treat "works under pi / Claude Code /
+Codex CLI / Amp / Droid" as **untested** until someone runs it there and reports back.
 
-This is a port of an earlier Perplexity Pro skill (originally built for OpenClaw) to the
-[badlogic/pi-skills](https://github.com/badlogic/pi-skills) format, using `puppeteer-core`
-and Chrome on port `9222`.
+It drives the **OpenClaw-managed Chrome** (CDP on `:18800`; `PERPLEXITY_CDP` overrides).
+This began as a port of the earlier OpenClaw skill into the pi-skills layout, which is why
+the front matter still reads "pi-adapted" — the OpenClaw wiring is the tested one.
 
 ## Installation
 
@@ -65,7 +68,7 @@ The `{baseDir}` placeholder is replaced with the skill's directory path at runti
 
 ## Requirements
 
-- **Chrome** running with remote debugging on `:9222`
+- **Chrome** running with remote debugging on `:18800` (the OpenClaw-managed browser; `PERPLEXITY_CDP` overrides)
 - A **Perplexity Pro** account, logged in within that Chrome profile
 - **Node.js** — run `npm install` in `perplexity-pro/`, or reuse `puppeteer-core` from the
   [browser-tools](https://github.com/badlogic/pi-skills/tree/main/browser-tools) skill (auto-detected)

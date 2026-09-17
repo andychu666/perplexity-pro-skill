@@ -31,7 +31,9 @@ const threadLocks = new Map();
 
 function withThreadLock(key, fn) {
   const prev = threadLocks.get(key) || Promise.resolve();
-  const run = prev.then(fn, fn);
+  // Run fn after prev settles, but never hand prev's settlement value to it:
+  // a predecessor's rejection must not arrive as fn's first argument.
+  const run = prev.then(() => fn(), () => fn());
   // `run.catch()` allocates a NEW promise every time it is called, so storing
   // one and comparing against another in finally never matched and the Map
   // entry was never deleted (unbounded lock-table growth). Keep the exact

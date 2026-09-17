@@ -589,6 +589,7 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = null) {
   let prev = '';
   let stableCount = 0;
   let best = '';
+  let stable = false;
   while (Date.now() - startTime < timeoutMs) {
     await sleep(POLL_MS);
     let cur = '';
@@ -599,7 +600,7 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = null) {
       let generating = false;
       try { generating = await isGenerating(); } catch (e) {}
       const needed = generating ? STABLE_NO_HINT : STABLE_WITH_HINT;
-      if (stableCount >= needed) break;
+      if (stableCount >= needed) { stable = true; break; }
     } else {
       stableCount = 0;
       prev = cur;
@@ -610,7 +611,16 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = null) {
   let finalText = '';
   try { finalText = await extractText(blocksBefore); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
   if (finalText.length < best.length) finalText = best;
-  return { text: finalText || best || '', isImageGen };
+  const text = finalText || best || '';
+  if (!stable) {
+    // The deadline passed before the text stopped growing: what we have is the
+    // longest prefix observed, NOT a complete answer. Say so explicitly — the
+    // old shape let every caller print a truncated prefix as a final answer with
+    // exit 0 — while still handing the partial text back so it is never dropped.
+    log('Warning: the answer never stopped growing before the timeout; returning ' + text.length + ' chars as an incomplete answer');
+    return { text, isImageGen, incomplete: true, reason: 'timeout' };
+  }
+  return { text, isImageGen };
 }
 
 async function runQuery(flags, query, timeoutMs) {
@@ -669,25 +679,35 @@ async function runQuery(flags, query, timeoutMs) {
           let answer = '';
           let slug = null;
           let lastError = null;
-          for (let attempt = 0; attempt < readbackAttempts && !answer; attempt++) {
-            if (attempt > 0) await sleep(readbackGapMs);
+          // Baseline unknown after the retry: no read-back can be attributed to
+          // this submit — the thread's last entry may still be the PREVIOUS turn's
+          // answer — so one read is kept as clearly-marked unverified content for
+          // the failure report below, and the run fails. It is never returned as
+          // this turn's answer, and polling 6 times would not help: nothing could
+          // ever verify it.
+          let unverifiedAnswer = '';
+          let unverifiedSlug = null;
+          if (entriesBefore === null) {
             try {
-              // Scope the walk-back to entries this submit could have added and
-              // require the count to have grown past the pre-submit snapshot:
-              // without both, a slow or aborted stream hands back the PREVIOUS
-              // turn's answer as this turn's reply. When the baseline could not be
-              // established even after the retry, accept the read-back rather than
-              // dead-ending on an answer the thread already holds.
-              const read = await session.latestAnswer(flags.thread,
-                entriesBefore === null ? {} : { minEntries: entriesBefore + 1 });
-              const grew = entriesBefore === null || (Number.isFinite(read.entries) && read.entries > entriesBefore);
-              if (grew && read.answer && read.answer.trim()) { answer = read.answer; slug = read.slug; }
+              const read = await session.latestAnswer(flags.thread);
+              if (read.answer && read.answer.trim()) { unverifiedAnswer = read.answer; unverifiedSlug = read.slug; }
             } catch (e) { lastError = e; }
+          } else {
+            for (let attempt = 0; attempt < readbackAttempts && !answer; attempt++) {
+              if (attempt > 0) await sleep(readbackGapMs);
+              try {
+                // Scope the walk-back to entries this submit could have added and
+                // require the count to have grown past the pre-submit snapshot:
+                // without both, a slow or aborted stream hands back the PREVIOUS
+                // turn's answer as this turn's reply.
+                const read = await session.latestAnswer(flags.thread, { minEntries: entriesBefore + 1 });
+                if (Number.isFinite(read.entries) && read.entries > entriesBefore && read.answer && read.answer.trim()) {
+                  answer = read.answer; slug = read.slug;
+                }
+              } catch (e) { lastError = e; }
+            }
           }
           if (answer && answer.trim()) {
-            if (entriesBefore === null) {
-              log('Warning: the thread entry count stayed unavailable; accepting the read-back without the growth check');
-            }
             log(`chat: answered via session (${answer.length} chars)`);
             return {
               query, answer, mode: 'chat', isImageGeneration: false,
@@ -708,6 +728,26 @@ async function runQuery(flags, query, timeoutMs) {
             } catch (e) { lastError = lastError || e; }
           }
           if (gainedEntry) {
+            if (entriesBefore === null) {
+              // The baseline never materialised, so the read-back can never be
+              // attributed to this submit: report FAILURE (the run exits non-zero
+              // through the structured error path) and carry the content that was
+              // read along as clearly-marked unverified output — never as the
+              // answer, never dropped.
+              const err = new Error('chat: the thread entry count stayed unavailable, so the answer read back from the thread'
+                + ' cannot be attributed to this submit (it may be the previous turn\'s answer); refusing to return it as this turn\'s answer'
+                + (lastError ? ' (' + lastError.message + ')' : '')
+                + '. Thread: ' + flags.thread);
+              if (unverifiedAnswer) {
+                err.partialResult = {
+                  query, answer: unverifiedAnswer, mode: 'chat', isImageGeneration: false,
+                  generatedImages: [], images: [], sources: [], screenshot: null,
+                  url: unverifiedSlug ? `https://www.perplexity.ai/search/${unverifiedSlug}` : flags.thread,
+                  incomplete: true, unverified: true, reason: 'baseline-unknown',
+                };
+              }
+              throw err;
+            }
             throw new Error('chat: the follow-up was submitted through the session layer but no answer could be read back from the thread'
               + ' after ' + readbackAttempts + ' attempts'
               + (lastError ? ' (' + lastError.message + ')' : '')
@@ -753,7 +793,7 @@ async function runQuery(flags, query, timeoutMs) {
       await typeQuery(perplexityPage, input, query);
       await sleep(500);
       await perplexityPage.keyboard.press('Enter');
-      const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags, blocksBefore);
+      const { text: answer, isImageGen, incomplete, reason } = await waitForAnswer(perplexityPage, timeoutMs, flags, blocksBefore);
 
       // Prefer reading the answer back from the thread itself: the thread JSON
       // carries the finished answer, so the result no longer depends on DOM
@@ -762,6 +802,13 @@ async function runQuery(flags, query, timeoutMs) {
       // otherwise the DOM answer stands — a correct DOM answer is never replaced
       // by a possibly stale one.
       let finalAnswer = answer;
+      // The timeout flag taints the DOM text only: a read-back that proved the
+      // thread grew past the pre-submit snapshot supplies this turn's answer
+      // itself, so the truncation the flag warns about no longer applies.
+      let incompleteAnswer = incomplete === true;
+      // Kept for the failure report only: with no pre-submit baseline, a read-back
+      // cannot be attributed to this submit — it may be the PREVIOUS turn's answer.
+      let unverifiedReadback = null;
       if (!isImageGen) {
         try {
           const session = require('./session.js');
@@ -770,9 +817,15 @@ async function runQuery(flags, query, timeoutMs) {
           const grew = entriesBeforeUi !== null && Number.isFinite(read.entries) && read.entries > entriesBeforeUi;
           if (grew && read.answer && read.answer.trim()) {
             finalAnswer = read.answer;
+            incompleteAnswer = false;
             log(`chat: read answer back from the session (${read.answer.length} chars, ${read.entries} entries)`);
           } else if (entriesBeforeUi !== null) {
             log('chat: the thread did not grow past the pre-submit entry count; keeping the DOM answer');
+          } else if (read.answer && read.answer.trim()) {
+            // Baseline unknown: never accepted as the answer (the DOM answer
+            // stands), kept strictly as unverified content for a failure report.
+            unverifiedReadback = read.answer;
+            log('chat: the pre-submit entry count is unavailable, so the session read-back cannot be attributed to this submit; keeping it as unverified content only');
           }
         } catch (e) {
           log('Warning: session read-back failed (' + e.message + '); using the DOM answer');
@@ -787,10 +840,23 @@ async function runQuery(flags, query, timeoutMs) {
         // An empty extraction used to be returned as the placeholder string with
         // exit 0, so a timeout / login wall / block looked like a complete answer
         // to every caller and cache. Fail loudly instead.
-        throw new Error('No answer extracted for the follow-up — the page may be showing a login wall, '
+        const err = new Error('No answer extracted for the follow-up — the page may be showing a login wall, '
           + 'a block, or an empty response. Current URL: ' + perplexityPage.url());
+        if (unverifiedReadback) {
+          // The baseline-unknown read-back is never the answer, but it is the only
+          // content this run obtained: report it as unverified instead of dropping it.
+          err.partialResult = {
+            query, answer: unverifiedReadback, mode: 'chat', isImageGeneration: isImageGen,
+            generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url(),
+            incomplete: true, unverified: true, reason: 'baseline-unknown',
+          };
+        }
+        throw err;
       }
-      return { query, answer: finalAnswer, mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url() };
+      if (incompleteAnswer) {
+        log('chat: reporting the run as incomplete (timeout before the answer stopped growing); the partial answer is included in the result');
+      }
+      return { query, answer: finalAnswer, mode: 'chat', isImageGeneration: isImageGen, generatedImages, images: [], sources: [], screenshot: screenshotPath, url: perplexityPage.url(), ...(incompleteAnswer ? { incomplete: true, reason: reason || 'timeout' } : {}) };
     }
 
     const pages = await browser.pages();
@@ -847,7 +913,7 @@ async function runQuery(flags, query, timeoutMs) {
       } catch (e) { log('Warning: did not observe navigation to a new thread URL'); }
     }
 
-    const { text: answer, isImageGen } = await waitForAnswer(perplexityPage, timeoutMs, flags);
+    const { text: answer, isImageGen, incomplete, reason } = await waitForAnswer(perplexityPage, timeoutMs, flags);
     let generatedImages = [];
     if (isImageGen) generatedImages = await waitAndDownloadImages(perplexityPage, 60000);
 
@@ -867,7 +933,10 @@ async function runQuery(flags, query, timeoutMs) {
       throw new Error('No answer extracted — timeout, login wall or empty response. Current URL: '
         + perplexityPage.url());
     }
-    return { query, answer: answer || '[Image generated - see generatedImages]', mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url() };
+    if (incomplete) {
+      log('Warning: reporting the run as incomplete (timeout before the answer stopped growing); the partial answer is included in the result');
+    }
+    return { query, answer: answer || '[Image generated - see generatedImages]', mode: getModeLabel(flags), isImageGeneration: isImageGen, generatedImages, images, sources, screenshot: screenshotPath, url: perplexityPage.url(), ...(incomplete ? { incomplete: true, reason: reason || 'timeout' } : {}) };
   } finally {
     // Tabs we opened are ours to close: the old code only disconnected, so
     // every run leaked a tab (and its memory) into the long-lived browser.
@@ -1172,7 +1241,9 @@ async function main() {
     try {
       const result = await runQuery(flags, finalQuery, timeoutMs);
       console.log(JSON.stringify(result, null, 2));
-      process.exit(0);
+      // The partial answer is printed above (never dropped), but a run that never
+      // reached a stable answer is not a success.
+      process.exit(result.incomplete ? 1 : 0);
     } catch (err) {
       lastError = err;
       log('Attempt ' + (attempt + 1) + ' failed: ' + err.message);
@@ -1183,6 +1254,14 @@ async function main() {
     }
   }
   console.error('ERROR: All attempts failed. Last error: ' + (lastError ? lastError.message : 'unknown'));
+  // A failure that still holds content (a read-back that could not be attributed
+  // to this submit) must not swallow it: the structured error on stderr and the
+  // JSON result on stdout both carry it, clearly marked unverified, and the exit
+  // code stays non-zero.
+  if (lastError && lastError.partialResult) {
+    console.error('ERROR: unverified partial result: ' + JSON.stringify(lastError.partialResult));
+    console.log(JSON.stringify(lastError.partialResult, null, 2));
+  }
   process.exit(1);
 }
 

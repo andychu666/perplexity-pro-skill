@@ -462,19 +462,26 @@ async function typeQuery(page, input, query) {
   }
 }
 
-// Count the prose/markdown blocks currently mounted. Callers snapshot this before
-// submitting so extraction can restrict itself to the new answer's blocks.
+// The selector lists extraction walks, in priority order: the classes Perplexity
+// currently renders answers in first, then the fallbacks used when an answer
+// renders without them. The pre-submit snapshot counts EVERY list separately —
+// the lists have different lengths, so one shared index would either cut real
+// blocks or keep earlier turns' prose.
+const EXTRACT_SELECTORS = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
+
+// Snapshot how many blocks each extraction list currently has mounted. Callers
+// take this before submitting so extraction can restrict itself to the blocks
+// mounted after it — each list's count is a valid index into that very list.
 async function countProseBlocks(page) {
-  // Throws when the snapshot fails: returning 0 would silently disable the
+  // Throws when the snapshot fails: an empty snapshot would silently disable the
   // pre-submit scoping and let the previous turn's prose be extracted as the new
   // answer. Only the chat path calls this, so a failed snapshot fails loudly
   // there instead of degrading into the leak this scoping exists to prevent.
-  return await page.evaluate(() =>
-    document.querySelectorAll('[class*="prose"], [class*="markdown"]').length
-  );
+  return await page.evaluate((selectors) =>
+    selectors.map((sel) => document.querySelectorAll(sel).length), EXTRACT_SELECTORS);
 }
 
-async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
+async function waitForAnswer(page, timeoutMs, flags, blocksBefore = null) {
   const startTime = Date.now();
     // Every warm-up wait is bounded by the REMAINING budget: the flat 5s plus up
     // to 12 x 3s below ignored --timeout entirely, so a short timeout was blown
@@ -517,28 +524,34 @@ async function waitForAnswer(page, timeoutMs, flags, blocksBefore = 0) {
   // answer into one or more [class*="prose"] blocks; the LAST block is not always
   // the answer (it can be a short trailing/related block), so pick the LONGEST
   // block, which is the full answer body.
-  // `blocksBefore` = number of prose/markdown blocks that already existed before
-  // this query was submitted. In an existing chat thread the earlier turns' prose
-  // stays mounted, and picking the longest text would return the PREVIOUS answer
-  // instead of the new one, so restrict the search to blocks after that index.
-  const extractText = (blocksBefore = 0) => page.evaluate((before) => {
-    const selectors = ['[class*="prose"]', '[class*="markdown"]', '.whitespace-pre-wrap', 'article'];
+  // `blocksBefore` = per-list block counts snapshotted before this query was
+  // submitted (null when the caller did not snapshot). In an existing chat thread
+  // the earlier turns' blocks stay mounted, and picking the longest text would
+  // return the PREVIOUS answer instead of the new one, so a scoped run keeps only
+  // the blocks mounted after the snapshot in each list.
+  const extractText = (blocksBefore = null) => page.evaluate((before, selectors) => {
+    // All selectors stay in play in scoped (chat) runs: each list is sliced at its
+    // own pre-submit count — the index into the very list the snapshot counted —
+    // so an answer rendering in a fallback selector is still found instead of
+    // polling empty until the whole timeout burns.
+    const scoped = Array.isArray(before);
+    if (scoped && before.length !== selectors.length) throw new Error('block snapshot does not match the extraction selectors');
     let best = '';
-    for (const sel of selectors) {
-      const all = Array.from(document.querySelectorAll(sel));
-      const els = before > 0 ? all.slice(before) : all;
+    for (let i = 0; i < selectors.length; i++) {
+      const all = Array.from(document.querySelectorAll(selectors[i]));
+      const els = scoped ? all.slice(before[i]) : all;
       for (const el of els) {
         const text = (el && el.innerText) ? el.innerText : '';
         if (text.length > best.length) best = text;
       }
       if (best.length > 5) break;
     }
-    // A scoped slice (before > 0) that came back empty means the thread's blocks
-    // are re-mounting: return nothing so the caller keeps polling and its
+    // A scoped slice that came back empty means the thread's blocks are
+    // re-mounting: return nothing so the caller keeps polling and its
     // "no answer extracted" check fails loudly. Falling back to the newest
     // mounted block would silently return the PREVIOUS turn's answer.
     return best;
-  }, blocksBefore);
+  }, blocksBefore, EXTRACT_SELECTORS);
 
   // Best-effort hint: is Perplexity still actively streaming the answer? When a
   // "stop generating" control is present we are definitely still streaming. This
@@ -619,11 +632,18 @@ async function runQuery(flags, query, timeoutMs) {
         let entriesBefore = null;
         try {
           session = require('./session.js');
-          try {
-            const snapshot = await session.latestAnswer(flags.thread);
-            if (snapshot && Number.isFinite(snapshot.entries)) entriesBefore = snapshot.entries;
-          } catch (e) {
-            log('Warning: could not snapshot the thread entry count (' + e.message + '); the UI fallback will be unavailable if the submit does not land');
+          // The count is the growth baseline the read-back below needs, and a
+          // transient read failure here would dead-end the whole submit, so retry
+          // it once before leaving the baseline unknown.
+          for (let snapshotAttempt = 0; snapshotAttempt < 2 && entriesBefore === null; snapshotAttempt++) {
+            try {
+              const snapshot = await session.latestAnswer(flags.thread);
+              if (snapshot && Number.isFinite(snapshot.entries)) entriesBefore = snapshot.entries;
+            } catch (e) {
+              if (snapshotAttempt === 1) {
+                log('Warning: could not snapshot the thread entry count (' + e.message + '); the UI fallback will be unavailable if the submit does not land');
+              }
+            }
           }
           log('chat: submitting through the session layer (no UI)');
           submitted = true;
@@ -652,11 +672,22 @@ async function runQuery(flags, query, timeoutMs) {
           for (let attempt = 0; attempt < readbackAttempts && !answer; attempt++) {
             if (attempt > 0) await sleep(readbackGapMs);
             try {
-              const read = await session.latestAnswer(flags.thread);
-              if (read.answer && read.answer.trim()) { answer = read.answer; slug = read.slug; }
+              // Scope the walk-back to entries this submit could have added and
+              // require the count to have grown past the pre-submit snapshot:
+              // without both, a slow or aborted stream hands back the PREVIOUS
+              // turn's answer as this turn's reply. When the baseline could not be
+              // established even after the retry, accept the read-back rather than
+              // dead-ending on an answer the thread already holds.
+              const read = await session.latestAnswer(flags.thread,
+                entriesBefore === null ? {} : { minEntries: entriesBefore + 1 });
+              const grew = entriesBefore === null || (Number.isFinite(read.entries) && read.entries > entriesBefore);
+              if (grew && read.answer && read.answer.trim()) { answer = read.answer; slug = read.slug; }
             } catch (e) { lastError = e; }
           }
           if (answer && answer.trim()) {
+            if (entriesBefore === null) {
+              log('Warning: the thread entry count stayed unavailable; accepting the read-back without the growth check');
+            }
             log(`chat: answered via session (${answer.length} chars)`);
             return {
               query, answer, mode: 'chat', isImageGeneration: false,
@@ -709,6 +740,16 @@ async function runQuery(flags, query, timeoutMs) {
       // Snapshot the block count before submitting so extraction can ignore the
       // earlier turns already mounted in this thread.
       const blocksBefore = await countProseBlocks(perplexityPage);
+      // Same for the thread's entry count: the read-back below only accepts an
+      // answer from an entry this submit added, or a slow stream hands back the
+      // PREVIOUS turn's answer over the DOM answer this run already extracted.
+      let entriesBeforeUi = null;
+      try {
+        const snapshot = await require('./session.js').latestAnswer(perplexityPage.url());
+        if (snapshot && Number.isFinite(snapshot.entries)) entriesBeforeUi = snapshot.entries;
+      } catch (e) {
+        log('Warning: could not snapshot the thread entry count (' + e.message + '); the session read-back will be skipped');
+      }
       await typeQuery(perplexityPage, input, query);
       await sleep(500);
       await perplexityPage.keyboard.press('Enter');
@@ -716,15 +757,22 @@ async function runQuery(flags, query, timeoutMs) {
 
       // Prefer reading the answer back from the thread itself: the thread JSON
       // carries the finished answer, so the result no longer depends on DOM
-      // extraction at all (only the submission still touches the UI).
+      // extraction at all (only the submission still touches the UI). The read-back
+      // is accepted only when the thread grew past the pre-submit snapshot;
+      // otherwise the DOM answer stands — a correct DOM answer is never replaced
+      // by a possibly stale one.
       let finalAnswer = answer;
       if (!isImageGen) {
         try {
           const session = require('./session.js');
-          const read = await session.latestAnswer(perplexityPage.url());
-          if (read.answer && read.answer.trim()) {
+          const read = await session.latestAnswer(perplexityPage.url(),
+            entriesBeforeUi === null ? {} : { minEntries: entriesBeforeUi + 1 });
+          const grew = entriesBeforeUi !== null && Number.isFinite(read.entries) && read.entries > entriesBeforeUi;
+          if (grew && read.answer && read.answer.trim()) {
             finalAnswer = read.answer;
             log(`chat: read answer back from the session (${read.answer.length} chars, ${read.entries} entries)`);
+          } else if (entriesBeforeUi !== null) {
+            log('chat: the thread did not grow past the pre-submit entry count; keeping the DOM answer');
           }
         } catch (e) {
           log('Warning: session read-back failed (' + e.message + '); using the DOM answer');
@@ -750,17 +798,30 @@ async function runQuery(flags, query, timeoutMs) {
     // any other Perplexity tab (an unsent draft, a thread the user is reading)
     // would destroy their state.
     const targetUrl = flags.computer ? 'https://www.perplexity.ai/computer/new' : 'https://www.perplexity.ai/';
-    let perplexityPage = pages.find(p => p.url() === targetUrl) || null;
+    // Compare origin + path only: the target URL carries no query string, so a tab
+    // on the same path but with `?q=` / `?source=` / `?login=` would otherwise read
+    // as "elsewhere" and get reloaded — wiping the very composer draft the reuse
+    // exists to protect. A trailing slash is equally not a difference.
+    const onTarget = (url) => {
+      try {
+        const a = new URL(url); const b = new URL(targetUrl);
+        return a.origin === b.origin
+          && a.pathname.replace(/\/+$/, '') === b.pathname.replace(/\/+$/, '');
+      } catch (e) { return url === targetUrl; }
+    };
+    let perplexityPage = pages.find(p => onTarget(p.url())) || null;
+    const created = !perplexityPage;
     if (!perplexityPage) { perplexityPage = await browser.newPage(); openedPage = perplexityPage; }
     await perplexityPage.bringToFront();
 
-    if (flags.computer) {
-      await perplexityPage.goto('https://www.perplexity.ai/computer/new', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(3000);
-    } else {
-      await perplexityPage.goto('https://www.perplexity.ai/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await sleep(2000);
+    // Navigate only when the tab is not already there — a goto() on the URL it is
+    // already showing reloads the page and discards any composer draft, which is
+    // the exact state the reuse above protects. A tab we just created still has
+    // to be navigated to.
+    if (created || !onTarget(perplexityPage.url())) {
+      await perplexityPage.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     }
+    await sleep(flags.computer ? 3000 : 2000);
 
     await dismissModals(perplexityPage);
     if (flags.deep) await toggleDeepResearch(perplexityPage);

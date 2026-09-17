@@ -291,6 +291,41 @@ ask Perplexity about itself.**
 - Use `--chat` to follow up on a previous query in the same thread
 - Use `--url` to ask Perplexity to analyze a specific webpage
 
+## Session reuse (no UI driving)
+
+The OpenClaw Chrome profile already holds a signed-in Perplexity Pro session.
+`scripts/perplexity-session.mjs` reads its cookies over CDP (including the
+httpOnly session cookies) and pairs the CSRF cookie with an `x-csrf-token`
+header, so internal endpoints can be called without clicking through the UI:
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread https://www.perplexity.ai/search/<slug>
+node scripts/perplexity-session.mjs --json --thread <slug>
+```
+
+Cookies are never printed and never written to disk. This is the least brittle
+layer (no menu selectors, no composer typing, no stream waiting).
+
+```bash
+node scripts/perplexity-session.mjs --whoami
+node scripts/perplexity-session.mjs --thread <url|slug>
+node scripts/perplexity-session.mjs --history "<term>" [--limit N]
+node scripts/perplexity-session.mjs --discover [--limit N]
+node scripts/perplexity-session.mjs --models
+node scripts/perplexity-session.mjs --ask "<question>" [--thread <url>] [--model <id>]
+```
+
+- `--ask` submits through the session layer, so a follow-up needs no composer at
+  all; `--model` picks any id from `--models` (model switching without the UI)
+- `--discover` reads the Discover feed, `--models` lists the account's models
+- `--history` scans the thread list in 200-item pages (the endpoint ignores a
+  search field and the GraphQL API only serves allow-listed operations, so there
+  is no server-side thread search to call)
+
+Fall back to the UI path only for actions that exist nowhere else (Computer mode,
+interactive Discover browsing).
+
 ## Deep research via the Agent API (preferred when a key is set)
 
 `--deep` through the browser is fragile (the mode lives in the composer's `/`

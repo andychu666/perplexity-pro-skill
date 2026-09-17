@@ -159,7 +159,18 @@ async function request(method, url, body) {
     die('NETWORK_ERROR', `${method} ${url} failed: ${why}`, 'Check connectivity and the API key, then retry.');
   }
   try {
-    const text = await res.text();
+    let text;
+    try {
+      text = await res.text();
+    } catch (e) {
+      // A body read can fail on its own (abort mid-body, connection reset) and
+      // must keep the JSON error contract instead of surfacing as an unhandled
+      // rejection inside the caller's poll loop.
+      const why = e && e.name === 'AbortError'
+        ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+        : (e && e.message) || String(e);
+      die('NETWORK_ERROR', `${method} ${url} body read failed: ${why}`, 'Check connectivity and retry.');
+    }
     let json = null;
     try { json = JSON.parse(text); } catch { /* non-JSON error body */ }
     return { status: res.status, json, text };

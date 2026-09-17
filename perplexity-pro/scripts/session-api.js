@@ -181,18 +181,25 @@ function parseAskStream(text) {
   // The stream re-sends a block as it grows (and may send several distinct
   // blocks), so a naive append duplicates the answer and keeping only the last
   // one truncates it. Track the most complete version of each block: exact
-  // repeats are dropped, a longer version of a known block replaces it, and a
-  // shorter prefix of a known block is ignored.
+  // repeats are dropped, a longer version of the last block replaces it in
+  // place, and a shorter (or equal) prefix of the last block is a lagging /
+  // retried retransmit of that same block and is dropped.
   const keep = (raw) => {
     const t = String(raw || '').trim();
     if (!t) return;
     if (answers.includes(t)) return;
-    // The stream re-sends the SAME block as it grows, so a longer version of
-    // the block we just appended replaces it in place. Comparing against every
-    // earlier block (the old rule) could delete a distinct block that merely
-    // happens to be a prefix of a later one.
+    // Only the LAST block is compared: the stream re-sends the same block as it
+    // grows, so a longer version of the block we just appended replaces it in
+    // place, while a shorter version of it is an out-of-order retransmit that
+    // must not be appended as a duplicate. Comparing against every earlier
+    // block (the old rule) could delete a distinct block that merely happens to
+    // be a prefix of a later one.
     const last = answers.length - 1;
-    if (last >= 0 && t.startsWith(answers[last])) { answers[last] = t; return; }
+    if (last >= 0) {
+      const prev = answers[last];
+      if (t.startsWith(prev)) { answers[last] = t; return; }
+      if (prev.startsWith(t)) return;
+    }
     answers.push(t);
   };
 

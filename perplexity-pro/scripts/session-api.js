@@ -32,9 +32,14 @@ const threadLocks = new Map();
 function withThreadLock(key, fn) {
   const prev = threadLocks.get(key) || Promise.resolve();
   const run = prev.then(fn, fn);
-  threadLocks.set(key, run.catch(() => {})); // never poison the chain
+  // `run.catch()` allocates a NEW promise every time it is called, so storing
+  // one and comparing against another in finally never matched and the Map
+  // entry was never deleted (unbounded lock-table growth). Keep the exact
+  // guarded promise we stored.
+  const guarded = run.catch(() => {}); // never poison the chain
+  threadLocks.set(key, guarded);
   return run.finally(() => {
-    if (threadLocks.get(key) === run.catch(() => {})) threadLocks.delete(key);
+    if (threadLocks.get(key) === guarded) threadLocks.delete(key);
   });
 }
 
@@ -55,9 +60,12 @@ async function searchHistory(term, { limit = 10, pages = 3, perPage = 200 } = {}
   const needle = String(term || '').toLowerCase().trim();
   // Bounded: unclamped pages/limit let one call fire hundreds of requests and
   // hold the process for hours.
-  const safeLimit = Math.min(toInt(limit, 10), 500);
-  const safePages = Math.min(toInt(pages, 3), 10);
-  const safePerPage = Math.min(toInt(perPage, 200), 200);
+  // toInt accepts 0, and pages:0 / perPage:0 (or limit:0) skip the scan
+  // entirely yet still return a "complete" {hits:[], truncated:false} result.
+  // Clamp the floor to 1 so an empty answer always means "scanned and found none".
+  const safeLimit = Math.max(1, Math.min(toInt(limit, 10), 500));
+  const safePages = Math.max(1, Math.min(toInt(pages, 3), 10));
+  const safePerPage = Math.max(1, Math.min(toInt(perPage, 200), 200));
   // No server-side thread search exists (list_ask_threads ignores a `query`
   // field, and the GraphQL endpoint only accepts allow-listed operations), so
   // scan large pages instead: the endpoint serves up to 200 per request.
@@ -133,11 +141,14 @@ async function getThread(slugOrUrl, { cookies } = {}) {
 async function latestAnswer(slugOrUrl, { cookies, minEntries = 1 } = {}) {
   const { thread, slug } = await getThread(slugOrUrl, { cookies });
   const entries = Array.isArray(thread.entries) ? thread.entries : [];
-  if (entries.length < minEntries) return { slug, answer: '', entries: entries.length };
+  // A non-numeric minEntries made every later comparison NaN, so the walk-back
+  // loop never ran and the call silently reported "no answer". Coerce once.
+  const min = Math.max(1, toInt(minEntries, 1));
+  if (entries.length < min) return { slug, answer: '', entries: entries.length };
   // Never walk back past the entries the caller had already seen: a new entry
   // that is not filled in yet would otherwise surface the *previous* turn's
   // answer as this turn's reply.
-  const start = Math.max(0, Math.min(minEntries - 1, entries.length - 1));
+  const start = Math.max(0, Math.min(min - 1, entries.length - 1));
   for (let i = entries.length - 1; i >= start; i--) {
     const answer = entryAnswer(entries[i]);
     if (answer) return { slug, answer, entries: entries.length };
@@ -372,7 +383,11 @@ async function listModels({ cookies } = {}) {
   const jar = cookies || await getCookies();
   const res = await internalFetch(`/rest/models/config/v2?version=${API_VERSION}&source=default`, jar);
   const body = assertBody(res, 'model config',
-    (b) => b && typeof b === 'object' && b.models !== undefined && b.models !== null,
+    // A non-null but wrong-typed `models` (string/number) passed the old guard
+    // and then produced char-by-char `Object.entries` garbage or an empty list
+    // that looked like a successful response. Accept only a list or a map.
+    (b) => b && typeof b === 'object'
+      && (Array.isArray(b.models) || (b.models !== null && typeof b.models === 'object')),
     'expected a models payload');
   const models = body.models;
   const entries = Array.isArray(models)

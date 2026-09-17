@@ -19,13 +19,17 @@
 //   --timeout SEC   default 900 for high/xhigh, else 120
 //   --poll-interval SEC  background poll interval (default 10)
 
-import { mkdirSync, writeFileSync, renameSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const API_URL = 'https://api.perplexity.ai/v1/agent';
 const PRESETS = ['fast', 'low', 'medium', 'high', 'xhigh'];
 const BACKGROUND_PRESETS = new Set(['high', 'xhigh']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'incomplete']);
+// Any status we understand is terminal for polling purposes. TERMINAL alone was
+// narrower than FAIL_STATES/OK_STATES, so a job reporting `error`, `expired`,
+// `canceled` or `success` fell through to the sleep branch and polled until the
+// whole --timeout budget was burnt instead of failing fast (or finishing).
 // Terminal states that are NOT a successful job. The old code treated every
 // TERMINAL state as done, so a failed job wrote an empty report and exited 0.
 const FAIL_STATES = new Set(['failed', 'cancelled', 'canceled', 'incomplete', 'error', 'expired']);
@@ -186,7 +190,12 @@ function sources(payload) {
   const rows = [];
   for (const item of out) {
     if (item && item.type === 'search_results' && Array.isArray(item.results)) {
-      for (const r of item.results) rows.push({ title: r.title || '', url: r.url || '', snippet: r.snippet || '' });
+      for (const r of item.results) {
+        // The API can put a null in the list; dereferencing it crashed a
+        // finished (billed) run and broke the JSON error contract.
+        if (!r || typeof r !== 'object') continue;
+        rows.push({ title: r.title || '', url: r.url || '', snippet: r.snippet || '' });
+      }
     }
   }
   return rows;
@@ -212,9 +221,14 @@ async function poll(jobId, deadline) {
       continue;
     }
     if (status >= 400 || !json) {
-      die('API_ERROR', `poll failed with HTTP ${status}`, 'Retry with --resume.');
+      // Name the job in the hint: without it an automation holding the id could
+      // not collect the orphaned (billed) server-side job.
+      die('API_ERROR', `poll failed with HTTP ${status} for job ${jobId}`,
+        `Retry with --resume ${jobId}`);
     }
-    if (TERMINAL.has(json.status)) return assertCompleted(json, jobId);
+    if (TERMINAL.has(json.status) || FAIL_STATES.has(json.status) || OK_STATES.has(json.status)) {
+      return assertCompleted(json, jobId);
+    }
     process.stderr.write(`[research] job ${jobId}: ${json.status}\n`);
     await sleep(Math.max(0, Math.min(delay, deadline - Date.now())));
   }
@@ -234,6 +248,12 @@ if (opts.resume) {
       'Check the API key and preset.');
   }
   assertNotFailed(json, null);
+  // The id becomes a filename below, so it must match the allowed charset
+  // before it is ever joined into a path.
+  if (json.id !== undefined && json.id !== null && !JOB_ID.test(String(json.id))) {
+    die('API_ERROR', 'server returned a malformed job id',
+      'Refusing to use an unvalidated id as a filename; re-run the request.');
+  }
   if (opts.background) {
     if (!json.id) die('API_ERROR', 'background job started without a job id',
       'Nothing to collect; re-run the request.');
@@ -248,6 +268,14 @@ if (opts.resume) {
     } catch (e) {
       process.stderr.write(`[research] could not persist the job id: ${e && e.message}\n`);
     }
+    payload = await poll(json.id, Date.now() + opts.timeout * 1000);
+  } else if (json.status && !OK_STATES.has(json.status)) {
+    // A synchronous POST can still answer non-terminal (the API may accept the
+    // request and hand back a job id). The old code took any non-failed status
+    // as a finished report, so partial output was written as complete.
+    if (!json.id) die('JOB_STATE', `request reported ${json.status} without a job id`,
+      'Re-run the request.');
+    process.stderr.write(`[research] job ${json.id} accepted; collecting with --resume ${json.id}\n`);
     payload = await poll(json.id, Date.now() + opts.timeout * 1000);
   } else {
     payload = json;
@@ -270,18 +298,27 @@ const stamp = startedAt.toISOString().replace(/[:.]/g, '-').slice(0, 19);
 // Two runs in the same second used to overwrite each other's report (they are
 // billed). Pick the first free name and write through a temp file + rename so a
 // crash cannot leave a half-written result.
-function freeBase(dir, prefix) {
+// Reserve the name with an exclusive create instead of pre-checking with
+// existsSync: the check-then-write gap let two concurrent runs with the same
+// query pick the same base and silently overwrite each other's billed report.
+function writeReserved(dir, prefix, jsonText, mdText) {
   for (let n = 0; n < 1000; n++) {
     const base = join(dir, n === 0 ? prefix : `${prefix}-${n}`);
-    if (!existsSync(`${base}.json`) && !existsSync(`${base}.md`)) return base;
+    try {
+      writeFileSync(`${base}.json`, jsonText, { flag: 'wx' });
+      try {
+        writeFileSync(`${base}.md`, mdText, { flag: 'wx' });
+      } catch (e) {
+        try { rmSync(`${base}.json`, { force: true }); } catch { /* best effort */ }
+        throw e;
+      }
+      return base;
+    } catch (e) {
+      if (e && e.code === 'EEXIST') continue;
+      throw e;
+    }
   }
   die('OUTPUT_ERROR', 'could not find a free output filename', 'Clean up the output directory.');
-}
-
-function writeAtomic(path, data) {
-  const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, data, 'utf8');
-  renameSync(tmp, path);
 }
 
 const rawJson = JSON.stringify(payload.output || null);
@@ -298,9 +335,8 @@ const record = {
 let base;
 try {
   mkdirSync(outDir, { recursive: true });
-  base = freeBase(outDir, `${slugify(opts.query || jobId)}-${stamp}`);
-  writeAtomic(`${base}.json`, JSON.stringify(record, null, 2));
-  writeAtomic(`${base}.md`,
+  base = writeReserved(outDir, `${slugify(opts.query || jobId)}-${stamp}`,
+    JSON.stringify(record, null, 2),
     `# ${opts.query || jobId}\n\n_preset: ${opts.preset} · ${elapsed}s · ${jobId || 'n/a'}_\n\n${report}\n`);
 } catch (e) {
   // Keep the JSON error contract: an unwritable output directory must not

@@ -187,9 +187,12 @@ function parseAskStream(text) {
     const t = String(raw || '').trim();
     if (!t) return;
     if (answers.includes(t)) return;
-    const grown = answers.findIndex((a) => t.startsWith(a));
-    if (grown >= 0) { answers[grown] = t; return; }
-    if (answers.some((a) => a.startsWith(t))) return;
+    // The stream re-sends the SAME block as it grows, so a longer version of
+    // the block we just appended replaces it in place. Comparing against every
+    // earlier block (the old rule) could delete a distinct block that merely
+    // happens to be a prefix of a later one.
+    const last = answers.length - 1;
+    if (last >= 0 && t.startsWith(answers[last])) { answers[last] = t; return; }
     answers.push(t);
   };
 

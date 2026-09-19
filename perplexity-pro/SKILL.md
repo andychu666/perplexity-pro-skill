@@ -1,5 +1,5 @@
 ---
-name: perplexity-pro
+name: perplexity-skill-for-openclaw
 description: >
   Query Perplexity Pro for grounded AI answers with citations via Chrome CDP automation (pi-adapted).
   Use when (1) deep research with web citations needed, (2) questions where web_search

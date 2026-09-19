@@ -348,6 +348,72 @@ async function waitAndDownloadImages(page, timeoutMs) {
   return downloaded;
 }
 
+// ---
+// Page-level extraction fallback (Deep Research)
+//
+// 2026-09-19: a completed Deep Research run returned "[No answer received]" while
+// the report (43.9 KB) was verifiably on the page — the primary extractor only
+// trusts [class*="prose"] / [class*="markdown"] blocks and the deep-research
+// report did not render inside elements carrying those classes.
+// ---
+let ACTIVE_QUERY = '';
+
+const CHROME_LINES = new Set([
+  'Answer', 'Links', 'Images', 'Share', 'Read more', 'Ask a follow-up',
+  'Search', 'Computer', 'Model', 'Researched', 'Copy', 'Sources',
+  'Show more', 'Show less', 'Summarize', 'Follow up', 'Ask anything',
+]);
+
+function stripChromeAndEcho(raw, query) {
+  const rawLines = String(raw || '').split('\n');
+  const trim = (x) => x.trim();
+  const norm = (x) => String(x).normalize('NFKC');
+  let lines = rawLines.map(trim);
+  const q = trim(query || '');
+  if (q) {
+    const head = q.split('\n').map(trim).filter(Boolean);
+    const cp = (x) => Array.from(x).slice(0, 40).join('');
+    const firstAnchor = head.length ? cp(head[0]) : '';
+    const lastAnchor = head.length ? cp(head[head.length - 1]) : '';
+    const searchEnd = Math.min(lines.length, 200);
+    const hit = (anchor) => rawLines.findIndex((l, i) => i < searchEnd
+      && norm(trim(l)).startsWith(norm(anchor)));
+    const begin = firstAnchor ? hit(firstAnchor) : -1;
+    const end = lastAnchor && lastAnchor !== firstAnchor ? hit(lastAnchor) : -1;
+    if (begin >= 0) {
+      const stop = end > begin ? end : begin;
+      lines = lines.slice(stop + 1);
+    }
+    // Never return the echoed question itself.
+    while (firstAnchor && lines.length && norm(lines[0]).startsWith(norm(firstAnchor))) lines.shift();
+  }
+  lines = lines.filter((l) => l
+    && !CHROME_LINES.has(l)
+    && !/^\d+\s*(sources?|citations?)$/i.test(l)
+    && !/^\d{1,2}:\d{2}\s*(am|pm)?$/i.test(l));
+  return lines.join('\n').trim();
+}
+
+async function extractPageLevelFallback(page, query) {
+  try {
+    const read = () => page.evaluate(() => {
+      const m = document.querySelector('main') || document.body;
+      return (m && m.innerText) || '';
+    });
+    const first = await read();
+    await page.waitForTimeout(1500);
+    const second = await read();
+    // Compare lengths rather than requiring equality: live chrome (a running timer
+    // or a blinking cursor) must not veto recovery of a finished report.
+    if (second.length > first.length + 200) return '';
+    const cleaned = stripChromeAndEcho(second.length >= first.length ? second : first, query || ACTIVE_QUERY);
+    return cleaned.length > 800 ? cleaned : '';
+  } catch (e) {
+    log(`Warning: page-level fallback failed: ${e.message}`);
+    return '';
+  }
+}
+
 async function typeQuery(page, input, query) {
   const oneLine = query.replace(/\s*\n+\s*/g, ' ').trim();
   await input.click();
@@ -455,7 +521,12 @@ async function waitForAnswer(page, timeoutMs, flags) {
   // polls) but is never required, so a flaky heuristic can't pin us to the full
   // timeout.
   if (isImageGen) {
-    return { text: await extractText(), isImageGen };
+    let _t = await extractText();
+    if (flags.deep && _t.length < 1200) {
+      const f = await extractPageLevelFallback(page, ACTIVE_QUERY);
+      if (f && f.length > _t.length) { log(`deep: page-level fallback recovered ${f.length} chars`); _t = f; }
+    }
+    return { text: _t, isImageGen };
   }
 
   const STABLE_WITH_HINT = 2;   // stable polls needed when UI confirms not-generating
@@ -485,10 +556,16 @@ async function waitForAnswer(page, timeoutMs, flags) {
   let finalText = '';
   try { finalText = await extractText(); } catch (e) { log('Warning: final extraction failed: ' + e.message); }
   if (finalText.length < best.length) finalText = best;
-  return { text: finalText || best || '', isImageGen };
+  let _t2 = finalText || best || '';
+  if (flags.deep && _t2.length < 1200) {
+    const f2 = await extractPageLevelFallback(page, ACTIVE_QUERY);
+    if (f2 && f2.length > _t2.length) { log(`deep: page-level fallback recovered ${f2.length} chars`); _t2 = f2; }
+  }
+  return { text: _t2, isImageGen };
 }
 
 async function runQuery(flags, query, timeoutMs) {
+  ACTIVE_QUERY = query; // used by the page-level extraction fallback
   let browser;
   try {
     browser = await puppeteerLib().connect({ browserURL: CDP_URL, defaultViewport: null });
